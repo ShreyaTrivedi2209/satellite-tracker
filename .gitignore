@@ -1,0 +1,23 @@
+# App-generated files
+satellite-tracker/node_modules/
+satellite-tracker/dist/
+satellite-tracker/.vite/
+satellite-tracker/*.log
+
+# Python
+satellite-tracker/python/__pycache__/
+satellite-tracker/python/**/*.pyc
+satellite-tracker/venv/
+satellite-tracker/.venv/
+
+# Environment
+satellite-tracker/.env
+satellite-tracker/.env.*
+!satellite-tracker/.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

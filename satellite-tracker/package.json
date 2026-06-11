@@ -1,0 +1,34 @@
+{
+  "name": "satellite-tracker",
+  "version": "0.0.0",
+  "description": "Interactive 3D Earth dashboard for live satellite tracking from TLE data.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "api": "python python/server.py",
+    "api:windows": "py -3 python/server.py",
+    "start": "npm run dev",
+    "dev": "vite --host 127.0.0.1",
+    "dev:client": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "check": "npm run build"
+  },
+  "keywords": [
+    "satellite",
+    "tle",
+    "sgp4",
+    "threejs",
+    "vite"
+  ],
+  "devDependencies": {
+    "vite": "^8.0.12"
+  },
+  "dependencies": {
+    "three": "^0.184.0"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  }
+}

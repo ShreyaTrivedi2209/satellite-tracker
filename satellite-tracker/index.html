@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Active Satellites - 3D Earth</title>
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <div id="app">
+      <div id="canvas-container"></div>
+
+      <aside id="sat-controls" class="ui-panel" aria-label="Satellite filters">
+        <div class="panel-section">
+          <label class="filter-label" for="sat-search">Search satellites</label>
+          <input id="sat-search" type="text" autocomplete="off" placeholder="Name, NORAD ID, object ID">
+          <div id="search-results"></div>
+        </div>
+
+        <div class="panel-section">
+          <label class="filter-label" for="country-filter">Country / owner</label>
+          <select id="country-filter">
+            <option value="all">All countries</option>
+          </select>
+        </div>
+
+        <div class="panel-section">
+          <div class="filter-label">Altitude region</div>
+          <div class="filter-chips">
+            <button class="chip active" type="button" data-altitude-band="all">All</button>
+            <button class="chip" type="button" data-altitude-band="leo">LEO</button>
+            <button class="chip" type="button" data-altitude-band="meo">MEO</button>
+            <button class="chip" type="button" data-altitude-band="geo">GEO</button>
+            <button class="chip" type="button" data-altitude-band="heo">High</button>
+          </div>
+        </div>
+
+        <div class="panel-section">
+          <div class="filter-row">
+            <span class="filter-label">Inclination</span>
+            <span id="inclination-label">0° - 180°</span>
+          </div>
+          <input id="inclination-min" class="slider" type="range" min="0" max="180" value="0">
+          <input id="inclination-max" class="slider" type="range" min="0" max="180" value="180">
+        </div>
+
+        <div class="panel-section">
+          <div class="filter-row">
+            <span class="filter-label">Eccentricity</span>
+            <span id="eccentricity-label">&le; 1.00</span>
+          </div>
+          <input id="eccentricity-max" class="slider" type="range" min="0" max="1" step="0.01" value="1">
+        </div>
+
+        <div class="panel-section">
+          <div class="filter-row">
+            <span class="filter-label">Mean motion</span>
+            <span id="mean-motion-label">0 - 20 rev/day</span>
+          </div>
+          <input id="mean-motion-min" class="slider" type="range" min="0" max="20" step="0.1" value="0">
+          <input id="mean-motion-max" class="slider" type="range" min="0" max="20" step="0.1" value="20">
+        </div>
+      </aside>
+
+      <div id="sat-tooltip" role="status"></div>
+
+      <div id="iss-info">
+        <span style="opacity:0.5">Loading active satellites...</span>
+      </div>
+    </div>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

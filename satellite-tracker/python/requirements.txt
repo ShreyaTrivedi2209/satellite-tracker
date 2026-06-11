@@ -1,0 +1,9 @@
+# Python dependencies for the SGP4 satellite tracker API.
+# Install from the repository root with:
+#   python -m pip install -r python/requirements.txt
+
+flask==3.1.1
+flask-cors==5.0.1
+numpy==2.2.6
+requests==2.32.3
+sgp4==2.23
