@@ -34,13 +34,16 @@ const satelliteTracker = new SatelliteTracker(earthGroup, infoEl, {
   camera,
   renderer,
   container,
+  mapCanvas: document.getElementById('map-view'),
 });
 
 function animate() {
   requestAnimationFrame(animate);
   satelliteTracker.update();
-  controls.update();
-  renderer.render(scene, camera);
+  if (satelliteTracker.viewMode === '3d') {
+    controls.update();
+    renderer.render(scene, camera);
+  }
 }
 
 animate();

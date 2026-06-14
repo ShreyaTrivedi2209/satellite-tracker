@@ -19,7 +19,6 @@ import io
 from math import pi, pow
 from pathlib import Path
 
-import numpy as np
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -54,8 +53,7 @@ LOCAL_ACTIVE_TLE = Path(__file__).parent / "data" / "active_2le.txt"
 _XPDOTP = 1440.0 / (2.0 * pi)
 
 ISS_TLE_URLS = [
-    "https://celestrak.org/CAPI/query?NAME=ISS%20(ZARYA)&FORMAT=tle",
-    "https://celestrak.org/CAPI/query?CATNR=25544&FORMAT=tle",   # by NORAD ID
+    "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=tle",
     "https://celestrak.org/NORAD/elements/stations.txt",
     "https://celestrak.org/pub/TLE/stations.txt",
 ]
@@ -116,7 +114,12 @@ def fetch_iss_tle() -> tuple[str, str]:
             print(f"[TLE] Failed ({url}): {e}")
             last_err = e
 
-    print(f"[TLE] All sources failed, using embedded fallback: {last_err}")
+    local_iss = _load_local_iss_tle()
+    if local_iss != FALLBACK_ISS_TLE:
+        print(f"[TLE] All ISS sources failed, using local active catalog: {last_err}")
+        return local_iss
+
+    print(f"[TLE] All ISS sources failed, using embedded fallback: {last_err}")
     return FALLBACK_ISS_TLE
 
 
@@ -147,12 +150,25 @@ def _schedule_tle_refresh_if_stale():
 def get_cached_tle() -> tuple[str, str]:
     """Return cached TLE immediately; refresh in background when stale."""
     with _cache_lock:
-        if _tle_cache["line1"] is None:
-            _tle_cache["line1"], _tle_cache["line2"] = FALLBACK_ISS_TLE
-            _tle_cache["fetched_at"] = utc_now()
-            _schedule_tle_refresh_if_stale()
-            return _tle_cache["line1"], _tle_cache["line2"]
+        cached_line1 = _tle_cache["line1"]
+        cached_line2 = _tle_cache["line2"]
 
+    if cached_line1 is not None and cached_line2 is not None:
+        _schedule_tle_refresh_if_stale()
+        return cached_line1, cached_line2
+
+    try:
+        line1, line2 = fetch_iss_tle()
+        fetched_at = utc_now()
+    except Exception as e:
+        print(f"[TLE] Initial ISS fetch failed, using embedded fallback: {e}")
+        line1, line2 = FALLBACK_ISS_TLE
+        fetched_at = None
+
+    with _cache_lock:
+        _tle_cache["line1"] = line1
+        _tle_cache["line2"] = line2
+        _tle_cache["fetched_at"] = fetched_at
         _schedule_tle_refresh_if_stale()
         return _tle_cache["line1"], _tle_cache["line2"]
 
@@ -342,14 +358,38 @@ def _load_local_active_catalog() -> dict[str, dict]:
     }
 
 
+def _load_local_iss_tle() -> tuple[str, str]:
+    if LOCAL_ACTIVE_TLE.is_file():
+        try:
+            catalog = parse_2le_catalog(LOCAL_ACTIVE_TLE.read_text(encoding="utf-8"))
+            iss = catalog.get("25544")
+            if iss:
+                return iss["line1"], iss["line2"]
+        except Exception as e:
+            print(f"[TLE] Could not read local ISS TLE: {e}")
+    return FALLBACK_ISS_TLE
+
+
 def get_active_catalog() -> dict[str, dict]:
     with _cache_lock:
-        if _active_cache["tles"] is None:
-            _active_cache["tles"] = _load_local_active_catalog()
-            _active_cache["fetched_at"] = utc_now()
-            _schedule_active_refresh_if_stale()
-            return _active_cache["tles"]
+        cached_tles = _active_cache["tles"]
 
+    if cached_tles is not None:
+        _schedule_active_refresh_if_stale()
+        return cached_tles
+
+    try:
+        catalog = fetch_active_tles()
+        fetched_at = utc_now()
+    except Exception as e:
+        print(f"[TLE] Initial active catalog fetch failed, using local fallback: {e}")
+        catalog = _load_local_active_catalog()
+        fetched_at = None
+
+    with _cache_lock:
+        _active_cache["tles"] = catalog
+        _active_cache["fetched_at"] = fetched_at
+        _prop_cache["payload"] = None
         _schedule_active_refresh_if_stale()
         return _active_cache["tles"]
 
@@ -452,13 +492,14 @@ def gmst_angle(t: datetime.datetime) -> float:
     """
     Computes Greenwich Mean Sidereal Time in radians for UTC time t.
     """
-    J2000 = 2451545.0
     jd, fr = jday(t.year, t.month, t.day,
                   t.hour, t.minute, t.second + t.microsecond / 1_000_000)
-    T = (jd + fr - J2000) / 36525.0
+
+    days_since_j2000 = jd + fr - 2451545.0
+    T = days_since_j2000 / 36525.0
     theta = (
-        100.4606184
-        + 36000.77004 * T
+        280.46061837
+        + 360.98564736629 * days_since_j2000
         + 0.000387933 * T ** 2
         - T ** 3 / 38710000.0
     ) % 360.0
@@ -472,19 +513,25 @@ def eci_to_ecef(pos_eci: tuple, vel_eci: tuple, gmst: float):
     Vel_ECEF = Rz(-GMST) × ECI_vel  −  ω × ECEF_pos
     """
     cos_g, sin_g = math.cos(gmst), math.sin(gmst)
-    Rz = np.array([
-        [ cos_g,  sin_g, 0],
-        [-sin_g,  cos_g, 0],
-        [     0,       0, 1],
-    ])
+    x, y, z = pos_eci
+    vx, vy, vz = vel_eci
 
-    p = Rz @ np.array(pos_eci)
-    v = Rz @ np.array(vel_eci)
+    px = cos_g * x + sin_g * y
+    py = -sin_g * x + cos_g * y
+    pz = z
 
-    OMEGA = 7.2921150e-5          # Earth rotation rate, rad/s
-    v_ecef = v - np.cross([0, 0, OMEGA], p)
+    rvx = cos_g * vx + sin_g * vy
+    rvy = -sin_g * vx + cos_g * vy
+    rvz = vz
 
-    return tuple(float(x) for x in p), tuple(float(x) for x in v_ecef)
+    omega = 7.2921150e-5          # Earth rotation rate, rad/s
+    v_ecef = (
+        rvx + omega * py,
+        rvy - omega * px,
+        rvz,
+    )
+
+    return (float(px), float(py), float(pz)), tuple(float(value) for value in v_ecef)
 
 
 # ─────────────────────────────────────────────
@@ -710,7 +757,12 @@ if __name__ == "__main__":
     print("  http://localhost:5000/api/satellites")
     print("  http://localhost:5000/api/iss")
     print("=" * 50)
-    get_active_catalog()
-    get_cached_tle()
+    with _cache_lock:
+        _active_cache["tles"] = _load_local_active_catalog()
+        _active_cache["fetched_at"] = None
+        _tle_cache["line1"], _tle_cache["line2"] = _load_local_iss_tle()
+        _tle_cache["fetched_at"] = None
+    _schedule_active_refresh_if_stale()
+    _schedule_tle_refresh_if_stale()
 
     app.run(host="0.0.0.0", port=5000, debug=False)

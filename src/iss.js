@@ -101,8 +101,19 @@ export class ISSTracker {
   }
 
   _ecefToVec3(x, y, z) {
-    const scale = 1 / EARTH_RADIUS_KM;
-    return new THREE.Vector3(x * scale, y * scale, z * scale);
+    const rKm = Math.hypot(x, y, z);
+    if (!Number.isFinite(rKm) || rKm === 0) return new THREE.Vector3();
+
+    const r = rKm / EARTH_RADIUS_KM;
+    const lat = Math.asin(z / rKm);
+    const lon = Math.atan2(y, x);
+    const cosLat = Math.cos(lat);
+
+    return new THREE.Vector3(
+      r * cosLat * Math.cos(lon),
+      r * Math.sin(lat),
+      -r * cosLat * Math.sin(lon),
+    );
   }
 
   _setMarkerPosition(ecef) {

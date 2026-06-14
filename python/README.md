@@ -11,6 +11,9 @@ From the repository root:
 python -m pip install -r python/requirements.txt
 ```
 
+The requirements avoid NumPy and other compiled scientific packages, so this
+does not require GCC/C++ build tools on a Windows lab PC.
+
 ## Start The API
 
 From the repository root:

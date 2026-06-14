@@ -14,7 +14,6 @@ import sys
 import math
 import datetime
 import requests
-import numpy as np
 from sgp4.api import Satrec, jday
 
 
@@ -145,25 +144,31 @@ def eci_to_ecef(pos_eci: tuple, vel_eci: tuple, gmst: float) -> tuple:
     cos_g = math.cos(gmst)
     sin_g = math.sin(gmst)
 
-    # Rotation matrix Rz(-GMST)
-    Rz = np.array([
-        [ cos_g,  sin_g,  0],
-        [-sin_g,  cos_g,  0],
-        [     0,       0, 1]
-    ])
+    x, y, z = pos_eci
+    vx, vy, vz = vel_eci
 
-    pos_eci_vec = np.array(pos_eci)
-    vel_eci_vec = np.array(vel_eci)
-
-    pos_ecef = Rz @ pos_eci_vec
+    pos_ecef = (
+        cos_g * x + sin_g * y,
+        -sin_g * x + cos_g * y,
+        z,
+    )
+    vel_rot = (
+        cos_g * vx + sin_g * vy,
+        -sin_g * vx + cos_g * vy,
+        vz,
+    )
 
     # Earth's rotation rate (rad/s)
     omega_earth = 7.2921150e-5
 
     # Velocity: rotate + subtract Earth's rotation contribution
-    vel_ecef = Rz @ vel_eci_vec - np.cross([0, 0, omega_earth], pos_ecef)
+    vel_ecef = (
+        vel_rot[0] + omega_earth * pos_ecef[1],
+        vel_rot[1] - omega_earth * pos_ecef[0],
+        vel_rot[2],
+    )
 
-    return tuple(pos_ecef), tuple(vel_ecef)
+    return pos_ecef, vel_ecef
 
 
 # ─────────────────────────────────────────────

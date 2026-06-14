@@ -9,8 +9,21 @@
   <body>
     <div id="app">
       <div id="canvas-container"></div>
+      <canvas id="map-view" aria-label="2D latitude longitude satellite map"></canvas>
 
       <aside id="sat-controls" class="ui-panel" aria-label="Satellite filters">
+        <div class="panel-section">
+          <div class="filter-label">Earth view</div>
+          <div class="segmented-control" role="group" aria-label="Earth view mode">
+            <button class="segment active" type="button" data-view-mode="3d">3D</button>
+            <button class="segment" type="button" data-view-mode="2d">2D</button>
+          </div>
+          <label class="toggle-label orbit-toggle" for="orbit-toggle">
+            <input id="orbit-toggle" type="checkbox">
+            Project orbitals
+          </label>
+        </div>
+
         <div class="panel-section">
           <label class="filter-label" for="sat-search">Search satellites</label>
           <input id="sat-search" type="text" autocomplete="off" placeholder="Name, NORAD ID, object ID">
