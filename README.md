@@ -139,7 +139,7 @@ metadata when available and shows `Unknown` when that metadata cannot be
 fetched.
 
 ## Troubleshooting
-
+-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
 - If `npm run dev` fails on Windows PowerShell because scripts are disabled,
   run `npm.cmd run dev` instead.
 - If `npm run api` cannot find Python on Windows, run `npm run api:windows`.
