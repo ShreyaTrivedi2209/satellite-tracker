@@ -20,7 +20,7 @@ from math import pi, pow
 from pathlib import Path
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, redirect, request
 from flask_cors import CORS
 from sgp4.api import Satrec, WGS72, jday
 from sgp4.ext import days2mdhms
@@ -49,6 +49,7 @@ SATCAT_URLS = [
 ]
 
 LOCAL_ACTIVE_TLE = Path(__file__).parent / "data" / "active_2le.txt"
+LOCAL_SATCAT_CSV = Path(__file__).parent / "data" / "satcat.csv"
 
 _XPDOTP = 1440.0 / (2.0 * pi)
 
@@ -65,18 +66,45 @@ FALLBACK_ISS_TLE = (
 )
 
 _tle_cache = {"line1": None, "line2": None, "fetched_at": None, "refreshing": False}
-_active_cache = {"tles": None, "fetched_at": None, "refreshing": False}
+_active_cache = {
+    "tles": None,
+    "fetched_at": None,
+    "loaded_at": None,
+    "refreshing": False,
+    "source": None,
+    "source_status": "unknown",
+}
 _satcat_cache = {"meta": None, "fetched_at": None, "refreshing": False}
 _prop_cache = {"payload": None, "fetched_at": None}
 _cache_lock = threading.Lock()
 TLE_REFRESH_SECONDS = 600  # 10 minutes
-PROP_CACHE_SECONDS = 30
+PROP_CACHE_SECONDS = 1
 TLE_REQUEST_TIMEOUT = 15
 
 
 def utc_now() -> datetime.datetime:
     """Return a timezone-aware UTC timestamp."""
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def iso_or_none(value: datetime.datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def tle_epoch_to_utc(epoch: str) -> datetime.datetime | None:
+    """Convert a TLE epoch like 26166.12345678 to a UTC datetime."""
+    try:
+      year2 = int(epoch[:2])
+      year = year2 + 2000 if year2 < 57 else year2 + 1900
+      day_of_year = float(epoch[2:])
+      return (
+          datetime.datetime(year, 1, 1, tzinfo=datetime.timezone.utc)
+          + datetime.timedelta(days=day_of_year - 1)
+      )
+    except Exception:
+      return None
 
 
 def fetch_iss_tle() -> tuple[str, str]:
@@ -228,6 +256,23 @@ def parse_2le_catalog(text: str) -> dict[str, dict]:
     return catalog
 
 
+def parse_satcat_csv(text: str) -> dict[str, dict]:
+    rows = csv.DictReader(io.StringIO(text))
+    meta = {}
+    for row in rows:
+        norad = (row.get("NORAD_CAT_ID") or row.get("CATNR") or "").strip()
+        if not norad:
+            continue
+        meta[norad.zfill(5)] = {
+            "name": (row.get("OBJECT_NAME") or "").strip(),
+            "country": (row.get("OWNER") or row.get("COUNTRY") or "").strip() or "Unknown",
+            "object_type": (row.get("OBJECT_TYPE") or "").strip(),
+            "launch_date": (row.get("LAUNCH_DATE") or "").strip(),
+            "launch_site": (row.get("LAUNCH_SITE") or "").strip(),
+        }
+    return meta
+
+
 def fetch_satcat_meta() -> dict[str, dict]:
     last_err = None
     for url in SATCAT_URLS:
@@ -235,30 +280,26 @@ def fetch_satcat_meta() -> dict[str, dict]:
             print(f"[SATCAT] Fetching satellite metadata from {url}")
             r = requests.get(url, timeout=TLE_REQUEST_TIMEOUT)
             r.raise_for_status()
-            rows = csv.DictReader(io.StringIO(r.text))
-            meta = {}
-            for row in rows:
-                norad = (row.get("NORAD_CAT_ID") or row.get("CATNR") or "").strip()
-                if not norad:
-                    continue
-                meta[norad.zfill(5)] = {
-                    "name": (row.get("OBJECT_NAME") or "").strip(),
-                    "country": (row.get("OWNER") or row.get("COUNTRY") or "").strip() or "Unknown",
-                    "object_type": (row.get("OBJECT_TYPE") or "").strip(),
-                    "launch_date": (row.get("LAUNCH_DATE") or "").strip(),
-                    "launch_site": (row.get("LAUNCH_SITE") or "").strip(),
-                }
+            meta = parse_satcat_csv(r.text)
             if meta:
+                LOCAL_SATCAT_CSV.parent.mkdir(parents=True, exist_ok=True)
+                LOCAL_SATCAT_CSV.write_text(r.text, encoding="utf-8")
                 return meta
         except Exception as e:
             print(f"[SATCAT] Failed ({url}): {e}")
             last_err = e
 
+    if LOCAL_SATCAT_CSV.is_file():
+        print(f"[SATCAT] Using local fallback {LOCAL_SATCAT_CSV}")
+        meta = parse_satcat_csv(LOCAL_SATCAT_CSV.read_text(encoding="utf-8"))
+        if meta:
+            return meta
+
     print(f"[SATCAT] Metadata unavailable; country filters will use Unknown: {last_err}")
     return {}
 
 
-def fetch_active_tles() -> dict[str, tuple[str, str]]:
+def fetch_active_tles() -> tuple[dict[str, dict], str]:
     last_err = None
     for url in ACTIVE_TLE_URLS:
         try:
@@ -268,7 +309,9 @@ def fetch_active_tles() -> dict[str, tuple[str, str]]:
             catalog = parse_2le_catalog(r.text)
             if catalog:
                 print(f"[TLE] Loaded {len(catalog)} active satellites")
-                return catalog
+                LOCAL_ACTIVE_TLE.parent.mkdir(parents=True, exist_ok=True)
+                LOCAL_ACTIVE_TLE.write_text(r.text, encoding="utf-8")
+                return catalog, url
         except Exception as e:
             print(f"[TLE] Failed ({url}): {e}")
             last_err = e
@@ -277,7 +320,7 @@ def fetch_active_tles() -> dict[str, tuple[str, str]]:
         print(f"[TLE] Using local fallback {LOCAL_ACTIVE_TLE}")
         catalog = parse_2le_catalog(LOCAL_ACTIVE_TLE.read_text(encoding="utf-8"))
         if catalog:
-            return catalog
+            return catalog, str(LOCAL_ACTIVE_TLE)
 
     raise ConnectionError(f"Could not fetch active TLE catalog: {last_err}")
 
@@ -288,6 +331,7 @@ def _refresh_satcat_background():
         with _cache_lock:
             _satcat_cache["meta"] = meta
             _satcat_cache["fetched_at"] = utc_now()
+            _prop_cache["payload"] = None
     finally:
         with _cache_lock:
             _satcat_cache["refreshing"] = False
@@ -319,10 +363,14 @@ def get_satcat_meta() -> dict[str, dict]:
 
 def _refresh_active_background():
     try:
-        catalog = fetch_active_tles()
+        catalog, source = fetch_active_tles()
         with _cache_lock:
             _active_cache["tles"] = catalog
             _active_cache["fetched_at"] = utc_now()
+            _active_cache["loaded_at"] = _active_cache["fetched_at"]
+            _active_cache["source"] = source
+            _active_cache["source_status"] = "celestrak" if source.startswith("http") else "local-fallback"
+            _prop_cache["payload"] = None
     except Exception as e:
         print(f"[TLE] Active catalog refresh failed: {e}")
     finally:
@@ -373,22 +421,32 @@ def _load_local_iss_tle() -> tuple[str, str]:
 def get_active_catalog() -> dict[str, dict]:
     with _cache_lock:
         cached_tles = _active_cache["tles"]
+        if cached_tles is not None and _active_cache["source"] is None:
+            _active_cache["source"] = str(LOCAL_ACTIVE_TLE) if LOCAL_ACTIVE_TLE.is_file() else "embedded ISS fallback"
+            _active_cache["source_status"] = "local-fallback"
+            _active_cache["loaded_at"] = utc_now()
 
     if cached_tles is not None:
         _schedule_active_refresh_if_stale()
         return cached_tles
 
     try:
-        catalog = fetch_active_tles()
+        catalog, source = fetch_active_tles()
         fetched_at = utc_now()
+        source_status = "celestrak" if source.startswith("http") else "local-fallback"
     except Exception as e:
         print(f"[TLE] Initial active catalog fetch failed, using local fallback: {e}")
         catalog = _load_local_active_catalog()
         fetched_at = None
+        source = str(LOCAL_ACTIVE_TLE) if LOCAL_ACTIVE_TLE.is_file() else "embedded ISS fallback"
+        source_status = "local-fallback"
 
     with _cache_lock:
         _active_cache["tles"] = catalog
         _active_cache["fetched_at"] = fetched_at
+        _active_cache["loaded_at"] = fetched_at or utc_now()
+        _active_cache["source"] = source
+        _active_cache["source_status"] = source_status
         _prop_cache["payload"] = None
         _schedule_active_refresh_if_stale()
         return _active_cache["tles"]
@@ -397,7 +455,7 @@ def get_active_catalog() -> dict[str, dict]:
 def propagate_to_ecef(line1: str, line2: str, t_utc: datetime.datetime, gmst: float):
     pos_eci, vel_eci = propagate_sgp4(line1, line2, t_utc)
     pos_ecef, vel_ecef = eci_to_ecef(pos_eci, vel_eci, gmst)
-    return pos_ecef, vel_ecef
+    return pos_eci, vel_eci, pos_ecef, vel_ecef
 
 
 # ─────────────────────────────────────────────
@@ -581,6 +639,10 @@ def _propagate_catalog(catalog: dict[str, dict]):
     now = utc_now()
     satcat_meta = get_satcat_meta()
     with _cache_lock:
+        tle_fetched_at = _active_cache["fetched_at"]
+        catalog_loaded_at = _active_cache["loaded_at"]
+        tle_source = _active_cache["source"]
+        tle_source_status = _active_cache["source_status"]
         if (
             _prop_cache["payload"] is not None
             and _prop_cache["fetched_at"] is not None
@@ -606,19 +668,24 @@ def _propagate_catalog(catalog: dict[str, dict]):
     mean_anomaly = []
     mean_motion = []
     bstar = []
+    epoch_utc = []
+    eci = []
     ecef = []
     skipped = 0
 
     for norad, sat in catalog.items():
         line1, line2 = sat["line1"], sat["line2"]
         try:
-            pos, vel = propagate_to_ecef(line1, line2, t_utc, gmst)
+            pos_eci, vel_eci, pos, vel = propagate_to_ecef(line1, line2, t_utc, gmst)
         except Exception:
             skipped += 1
             continue
         meta = satcat_meta.get(norad, {})
+        tle_name = sat.get("name") or ""
+        meta_name = meta.get("name") or ""
+        display_name = tle_name if tle_name and not tle_name.startswith("NORAD ") else meta_name or tle_name or f"NORAD {norad}"
         ids.append(norad)
-        names.append(meta.get("name") or sat.get("name") or f"NORAD {norad}")
+        names.append(display_name)
         countries.append(meta.get("country") or "Unknown")
         object_ids.append(sat.get("object_id") or "")
         object_types.append(meta.get("object_type") or "")
@@ -631,11 +698,18 @@ def _propagate_catalog(catalog: dict[str, dict]):
         mean_anomaly.append(sat["mean_anomaly"])
         mean_motion.append(sat["mean_motion"])
         bstar.append(sat["bstar"])
+        epoch_utc.append(iso_or_none(tle_epoch_to_utc(sat.get("epoch", ""))))
+        eci.extend([*pos_eci, *vel_eci])
         ecef.extend([*pos, *vel])
 
     payload = {
         "timestamp_utc": t_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
         "source": ACTIVE_TLE_URLS[0],
+        "tle_source": tle_source,
+        "tle_source_status": tle_source_status,
+        "catalog_loaded_at_utc": iso_or_none(catalog_loaded_at),
+        "celestrak_fetched_at_utc": iso_or_none(tle_fetched_at) if tle_source_status == "celestrak" else None,
+        "gmst_rad": gmst,
         "catalog": len(catalog),
         "propagated": len(ids),
         "skipped": skipped,
@@ -653,6 +727,8 @@ def _propagate_catalog(catalog: dict[str, dict]):
         "mean_anomaly": mean_anomaly,
         "mean_motion": mean_motion,
         "bstar": bstar,
+        "epoch_utc": epoch_utc,
+        "eci": eci,
         "ecef": ecef,
     }
 
@@ -680,6 +756,9 @@ def satellites_positions():
             with _cache_lock:
                 _active_cache["tles"] = catalog
                 _active_cache["fetched_at"] = utc_now()
+                _active_cache["loaded_at"] = _active_cache["fetched_at"]
+                _active_cache["source"] = "browser CelesTrak proxy"
+                _active_cache["source_status"] = "celestrak"
                 _prop_cache["payload"] = None
         else:
             catalog = get_active_catalog()
@@ -688,6 +767,12 @@ def satellites_positions():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/", methods=["GET"])
+def root():
+    """Send humans to the frontend instead of showing a Flask 404."""
+    return redirect("http://127.0.0.1:5180/", code=302)
 
 
 @app.route("/api/iss", methods=["GET"])
@@ -760,9 +845,13 @@ if __name__ == "__main__":
     with _cache_lock:
         _active_cache["tles"] = _load_local_active_catalog()
         _active_cache["fetched_at"] = None
+        _active_cache["loaded_at"] = utc_now()
+        _active_cache["source"] = str(LOCAL_ACTIVE_TLE) if LOCAL_ACTIVE_TLE.is_file() else "embedded ISS fallback"
+        _active_cache["source_status"] = "local-fallback"
         _tle_cache["line1"], _tle_cache["line2"] = _load_local_iss_tle()
         _tle_cache["fetched_at"] = None
     _schedule_active_refresh_if_stale()
     _schedule_tle_refresh_if_stale()
+    _schedule_satcat_refresh_if_stale()
 
     app.run(host="0.0.0.0", port=5000, debug=False)

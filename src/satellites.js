@@ -1,9 +1,10 @@
 import * as THREE from 'three';
 
 const EARTH_RADIUS_KM = 6371;
-const POLL_INTERVAL_MS = 60000;
+const POLL_INTERVAL_MS = 5000;
 const ISS_NORAD = '25544';
 const KM_SCALE = 1 / EARTH_RADIUS_KM;
+const EARTH_MU_KM3_S2 = 398600.4418;
 const CELESTRAK_2LE = '/api/celestrak/NORAD/elements/gp.php?GROUP=active&FORMAT=tle';
 const EARTH_MAP_SRC = '/textures/00_earthmap1k.jpg';
 const ORBIT_SAMPLE_COUNT = 160;
@@ -19,10 +20,14 @@ const DEFAULT_FILTERS = {
 };
 
 export function ecefKmToThree(x, y, z) {
-  const r = Math.hypot(x, y, z) * KM_SCALE;
-  if (!Number.isFinite(r) || r === 0) return new THREE.Vector3();
-  const lat = Math.asin(z / Math.hypot(x, y, z));
-  const lon = Math.atan2(y, x);
+  const geo = ecefToGeodetic(x, y, z);
+  return geodeticToThree(geo.lat, geo.lon, geo.alt);
+}
+
+function geodeticToThree(latDeg, lonDeg, altKm = 0) {
+  const r = Math.max(0.001, 1 + altKm * KM_SCALE);
+  const lat = THREE.MathUtils.degToRad(latDeg);
+  const lon = THREE.MathUtils.degToRad(lonDeg);
   const cosLat = Math.cos(lat);
 
   return new THREE.Vector3(
@@ -67,6 +72,34 @@ function formatDeg(value, pos, neg) {
   return `${Math.abs(value).toFixed(3)} ${suffix}`;
 }
 
+function formatIstTimestamp(value) {
+  if (!value) return '--';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '--';
+  return date.toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    hour12: false,
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+function formatAge(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  const ageSeconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
+  if (!Number.isFinite(ageSeconds)) return '';
+  if (ageSeconds < 60) return `${ageSeconds}s ago`;
+  const ageMinutes = Math.round(ageSeconds / 60);
+  if (ageMinutes < 90) return `${ageMinutes}m ago`;
+  const ageHours = Math.round(ageMinutes / 60);
+  if (ageHours < 48) return `${ageHours}h ago`;
+  return `${Math.round(ageHours / 24)}d ago`;
+}
+
 function altitudeBand(alt) {
   if (alt < 2000) return 'leo';
   if (alt < 35786 - 1500) return 'meo';
@@ -102,6 +135,16 @@ function splitDateline(points, width, height) {
   return segments;
 }
 
+function eciPointToEcef(point, gmst) {
+  const cosG = Math.cos(gmst);
+  const sinG = Math.sin(gmst);
+  return new THREE.Vector3(
+    cosG * point.x + sinG * point.y,
+    -sinG * point.x + cosG * point.y,
+    point.z,
+  );
+}
+
 function sampleOrbitFromState(x, y, z, vx, vy, vz) {
   const r = new THREE.Vector3(x, y, z);
   const v = new THREE.Vector3(vx, vy, vz);
@@ -109,17 +152,28 @@ function sampleOrbitFromState(x, y, z, vx, vy, vz) {
 
   if (r.lengthSq() === 0 || h.lengthSq() === 0) return [];
 
-  const radius = r.length();
-  const basisX = r.clone().normalize();
+  const rMag = r.length();
+  const hSq = h.lengthSq();
+  const eccentricityVector = new THREE.Vector3()
+    .crossVectors(v, h)
+    .multiplyScalar(1 / EARTH_MU_KM3_S2)
+    .sub(r.clone().multiplyScalar(1 / rMag));
+  const eccentricity = eccentricityVector.length();
+  const semiLatusRectum = hSq / EARTH_MU_KM3_S2;
+  const basisX = eccentricity > 1e-4 ? eccentricityVector.normalize() : r.clone().normalize();
   const basisY = new THREE.Vector3().crossVectors(h, basisX).normalize();
   const points = [];
 
   for (let i = 0; i <= ORBIT_SAMPLE_COUNT; i += 1) {
-    const theta = (i / ORBIT_SAMPLE_COUNT) * Math.PI * 2;
-    const p = basisX.clone()
-      .multiplyScalar(Math.cos(theta) * radius)
+    const theta = ((i / ORBIT_SAMPLE_COUNT) * Math.PI * 2) - Math.PI;
+    const denominator = 1 + eccentricity * Math.cos(theta);
+    if (Math.abs(denominator) < 1e-8) continue;
+    const radius = semiLatusRectum / denominator;
+    if (!Number.isFinite(radius) || radius <= 0) continue;
+    const point = basisX.clone()
+      .multiplyScalar(radius * Math.cos(theta))
       .add(basisY.clone().multiplyScalar(Math.sin(theta) * radius));
-    points.push(p);
+    points.push(point);
   }
 
   return points;
@@ -250,26 +304,19 @@ export class SatelliteTracker {
       }
     });
 
-    this.controlsEl?.querySelectorAll('[data-view-mode]').forEach((button) => {
-      button.addEventListener('click', () => this._setViewMode(button.dataset.viewMode));
-      button.addEventListener('pointerdown', (event) => {
-        event.preventDefault();
-        this._setViewMode(button.dataset.viewMode);
-      });
-    });
-
     const orbitToggle = this.controlsEl?.querySelector('#orbit-toggle');
     orbitToggle?.addEventListener('change', (event) => {
       this._showOrbitals = event.target.checked;
       this._rebuildOrbitals(true);
       this._drawMapView(true);
     });
-    this.controlsEl?.querySelector('label[for="orbit-toggle"]')?.addEventListener('pointerdown', (event) => {
-      event.preventDefault();
-      orbitToggle.checked = !orbitToggle.checked;
-      this._showOrbitals = orbitToggle.checked;
-      this._rebuildOrbitals(true);
-      this._drawMapView(true);
+
+    const panelToggle = document.getElementById('panel-toggle');
+    panelToggle?.addEventListener('click', () => {
+      const hidden = document.body.classList.toggle('panels-hidden');
+      panelToggle.setAttribute('aria-pressed', String(hidden));
+      panelToggle.setAttribute('aria-label', hidden ? 'Show side panels' : 'Hide side panels');
+      panelToggle.textContent = hidden ? 'Show panels' : 'Hide panels';
     });
 
     this.renderer?.domElement.addEventListener('pointermove', (event) => this._onPointerMove(event));
@@ -324,15 +371,20 @@ export class SatelliteTracker {
   _orbitPointsForIndex(index) {
     if (!this._snapshot || index < 0) return [];
     const i3 = index * 3;
-    const { pos, vel } = this._snapshot;
-    return sampleOrbitFromState(
-      pos[i3],
-      pos[i3 + 1],
-      pos[i3 + 2],
-      vel[i3],
-      vel[i3 + 1],
-      vel[i3 + 2],
+    const state = this._snapshot.eciPos && this._snapshot.eciVel
+      ? { pos: this._snapshot.eciPos, vel: this._snapshot.eciVel, inertial: true }
+      : { pos: this._snapshot.pos, vel: this._snapshot.vel, inertial: false };
+    const points = sampleOrbitFromState(
+      state.pos[i3],
+      state.pos[i3 + 1],
+      state.pos[i3 + 2],
+      state.vel[i3],
+      state.vel[i3 + 1],
+      state.vel[i3 + 2],
     );
+
+    if (!state.inertial) return points;
+    return points.map((point) => eciPointToEcef(point, this._snapshot.gmstRad));
   }
 
   _rebuildOrbitals(force = false) {
@@ -580,6 +632,8 @@ export class SatelliteTracker {
     const count = data.ids.length;
     const pos = new Float32Array(count * 3);
     const vel = new Float32Array(count * 3);
+    const eciPos = data.eci ? new Float32Array(count * 3) : null;
+    const eciVel = data.eci ? new Float32Array(count * 3) : null;
 
     for (let i = 0; i < count; i += 1) {
       const j = i * 6;
@@ -589,6 +643,15 @@ export class SatelliteTracker {
       vel[i * 3] = data.ecef[j + 3];
       vel[i * 3 + 1] = data.ecef[j + 4];
       vel[i * 3 + 2] = data.ecef[j + 5];
+
+      if (data.eci) {
+        eciPos[i * 3] = data.eci[j];
+        eciPos[i * 3 + 1] = data.eci[j + 1];
+        eciPos[i * 3 + 2] = data.eci[j + 2];
+        eciVel[i * 3] = data.eci[j + 3];
+        eciVel[i * 3 + 1] = data.eci[j + 4];
+        eciVel[i * 3 + 2] = data.eci[j + 5];
+      }
     }
 
     this._issIndex = data.ids.indexOf(ISS_NORAD);
@@ -597,8 +660,11 @@ export class SatelliteTracker {
       count,
       pos,
       vel,
+      eciPos,
+      eciVel,
       display: new Float32Array(count * 3),
       geodetic: Array.from({ length: count }, () => ({ lat: 0, lon: 0, alt: 0 })),
+      gmstRad: Number(data.gmst_rad ?? 0),
       timeMs: Date.parse(data.timestamp_utc),
     };
 
@@ -626,14 +692,13 @@ export class SatelliteTracker {
 
   _fillCurrentState() {
     if (!this._snapshot) return;
-    const dt = (Date.now() - this._snapshot.timeMs) / 1000;
     const { count, pos, vel, display, geodetic } = this._snapshot;
 
     for (let i = 0; i < count; i += 1) {
       const i3 = i * 3;
-      const x = pos[i3] + vel[i3] * dt;
-      const y = pos[i3 + 1] + vel[i3 + 1] * dt;
-      const z = pos[i3 + 2] + vel[i3 + 2] * dt;
+      const x = pos[i3];
+      const y = pos[i3 + 1];
+      const z = pos[i3 + 2];
       const point = ecefKmToThree(x, y, z);
       display[i3] = point.x;
       display[i3 + 1] = point.y;
@@ -724,10 +789,16 @@ export class SatelliteTracker {
       timeZone: 'Asia/Kolkata',
       hour12: false,
     });
+    const isCelestrak = data.tle_source_status === 'celestrak';
+    const loadedAt = isCelestrak ? data.celestrak_fetched_at_utc : data.catalog_loaded_at_utc;
+    const loadedAtText = formatIstTimestamp(loadedAt);
+    const loadedAge = formatAge(loadedAt);
+    const sourceStatus = isCelestrak ? 'CelesTrak' : 'Local fallback';
+    const loadedLabel = isCelestrak ? 'CelesTrak fetched' : 'Catalog loaded';
 
     this.infoEl.innerHTML = `
       <div class="iss-title">Active Satellites</div>
-      <div class="iss-time">Updated ${istStr} IST</div>
+      <div class="iss-time">Propagated ${istStr} IST</div>
       <table class="iss-table">
         <tr><td>Visible</td><td id="visible-count">${this._visibleIndices.length.toLocaleString()}</td></tr>
         <tr><td>Tracked</td><td>${data.propagated.toLocaleString()}</td></tr>
@@ -736,8 +807,11 @@ export class SatelliteTracker {
         <tr><th colspan="2">Selected Lat / Long</th></tr>
         <tr><td>Latitude</td><td id="selected-lat">--</td></tr>
         <tr><td>Longitude</td><td id="selected-lon">--</td></tr>
+        <tr><td>TLE epoch</td><td id="selected-tle-epoch">--</td></tr>
         <tr><th colspan="2">Source</th></tr>
-        <tr><td colspan="2" class="source-cell">CelesTrak active TLE + SATCAT metadata</td></tr>
+        <tr><td>Status</td><td>${sourceStatus}</td></tr>
+        <tr><td>${loadedLabel}</td><td>${loadedAtText}${loadedAge ? `<br><small>${loadedAge}</small>` : ''}</td></tr>
+        <tr><td colspan="2" class="source-cell">${data.tle_source || 'CelesTrak active TLE + SATCAT metadata'}</td></tr>
       </table>
       <div class="ground-map-wrap">
         <div class="ground-map-title">Ground point reference</div>
@@ -815,8 +889,14 @@ export class SatelliteTracker {
     const geo = this._snapshot.geodetic[index];
     const latEl = document.getElementById('selected-lat');
     const lonEl = document.getElementById('selected-lon');
+    const epochEl = document.getElementById('selected-tle-epoch');
     if (latEl) latEl.textContent = formatDeg(geo.lat, 'N', 'S');
     if (lonEl) lonEl.textContent = formatDeg(geo.lon, 'E', 'W');
+    if (epochEl) {
+      const epoch = this._snapshot.epoch_utc?.[index];
+      const age = formatAge(epoch);
+      epochEl.innerHTML = `${formatIstTimestamp(epoch)}${age ? `<br><small>${age}</small>` : ''}`;
+    }
   }
 
   _drawGroundMap(index = this._selectedIndex >= 0 ? this._selectedIndex : this._issIndex) {

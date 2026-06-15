@@ -90,10 +90,9 @@ function createLabeledEarthTexture(loader) {
 
 export function createEarth() {
   const earthGroup = new THREE.Group();
-  earthGroup.rotation.z = -23.4 * Math.PI / 180;
 
   const loader = new THREE.TextureLoader();
-  const geometry = new THREE.IcosahedronGeometry(1, 12);
+  const geometry = new THREE.SphereGeometry(1, 96, 48);
 
   // Evenly lit — no directional day/night shading
   const material = new THREE.MeshBasicMaterial({
