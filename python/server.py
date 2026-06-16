@@ -264,10 +264,16 @@ def parse_2le_catalog(text: str) -> dict[str, dict]:
     return catalog
 
 
+def write_normalized_text(path: Path, text: str) -> None:
+    """Persist fetched CelesTrak text without CRLF or trailing-space churn."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+
 def write_updated_active_tle(text: str) -> None:
     """Persist the most recent CelesTrak active catalog for offline reuse."""
-    UPDATED_ACTIVE_TLE.parent.mkdir(parents=True, exist_ok=True)
-    UPDATED_ACTIVE_TLE.write_text(text, encoding="utf-8")
+    write_normalized_text(UPDATED_ACTIVE_TLE, text)
 
 
 def _file_modified_utc(path: Path) -> datetime.datetime | None:
@@ -316,8 +322,7 @@ def fetch_satcat_meta() -> dict[str, dict]:
             r.raise_for_status()
             meta = parse_satcat_csv(r.text)
             if meta:
-                LOCAL_SATCAT_CSV.parent.mkdir(parents=True, exist_ok=True)
-                LOCAL_SATCAT_CSV.write_text(r.text, encoding="utf-8")
+                write_normalized_text(LOCAL_SATCAT_CSV, r.text)
                 return meta
         except Exception as e:
             print(f"[SATCAT] Failed ({url}): {e}")
