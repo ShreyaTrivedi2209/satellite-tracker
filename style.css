@@ -66,10 +66,80 @@ select {
 }
 
 body.panels-hidden #sat-controls,
-body.panels-hidden #iss-info {
+body.panels-hidden #iss-info,
+body.panels-hidden #info-panel-open {
   opacity: 0;
   pointer-events: none;
   transform: translateY(-8px);
+}
+
+body.info-panel-closed #iss-info {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(12px);
+}
+
+body.analytics-page #sat-controls,
+body.analytics-page #iss-info,
+body.analytics-page #panel-toggle,
+body.analytics-page #canvas-container,
+body.analytics-page #map-view,
+body.analytics-page #sat-tooltip,
+body.analytics-page #info-panel-open {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#analytics-side-link {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  z-index: 12;
+  min-width: 44px;
+  min-height: 108px;
+  padding: 10px 8px;
+  color: var(--text-bright);
+  background: rgba(5, 10, 20, 0.9);
+  border: 1px solid rgba(0, 200, 224, 0.42);
+  border-right: 0;
+  border-radius: 8px 0 0 8px;
+  cursor: pointer;
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  transform: translateY(-50%);
+  backdrop-filter: blur(8px);
+}
+
+#analytics-side-link:hover {
+  border-color: var(--accent);
+}
+
+body.analytics-page #analytics-side-link {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#info-panel-open {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  z-index: 11;
+  min-height: 34px;
+  padding: 0 12px;
+  color: var(--text-bright);
+  background: rgba(5, 10, 20, 0.9);
+  border: 1px solid rgba(0, 255, 170, 0.35);
+  border-radius: 8px;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  backdrop-filter: blur(8px);
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+body.info-panel-closed #info-panel-open {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 /* ── ISS Info Panel ── */
@@ -78,6 +148,9 @@ body.panels-hidden #iss-info {
   top: 20px;
   right: 20px;
   z-index: 10;
+  width: min(320px, calc(100vw - 40px));
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
   background: rgba(5, 10, 20, 0.88);
   border: 1px solid rgba(0, 255, 170, 0.35);
   border-radius: 8px;
@@ -108,12 +181,168 @@ body.panels-hidden #iss-info {
   transition: opacity 160ms ease, transform 160ms ease;
 }
 
+#analytics-panel {
+  position: absolute;
+  inset: 20px;
+  z-index: 15;
+  width: auto;
+  max-height: none;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  padding: 18px;
+  color: #c8e6e0;
+  border-radius: 8px;
+  border-color: rgba(0, 200, 224, 0.34);
+  box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(16px);
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+body.analytics-page #analytics-panel {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(0);
+}
+
+.analytics-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.panel-title {
+  color: var(--text-bright);
+  font-size: 14px;
+  font-weight: bold;
+  letter-spacing: 0.08em;
+}
+
+.panel-subtitle {
+  margin-top: 2px;
+  color: #7a9e96;
+  font-size: 10px;
+}
+
+.mini-button {
+  min-width: 54px;
+  min-height: 30px;
+  color: var(--text-bright);
+  background: rgba(10, 21, 32, 0.9);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.mini-button:hover {
+  border-color: var(--accent);
+}
+
+#analytics-body {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(260px, 1fr) minmax(160px, 30vh);
+  gap: 12px;
+  overflow-y: auto;
+}
+
+.analytics-controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+}
+
+.analytics-controls label {
+  display: grid;
+  gap: 6px;
+}
+
+#analytics-chart-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 280px;
+  border: 1px solid rgba(0, 200, 224, 0.28);
+  background: rgba(3, 16, 25, 0.92);
+}
+
+.analytics-table-wrap {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid rgba(0, 200, 224, 0.22);
+  background: rgba(3, 16, 25, 0.72);
+}
+
+#analytics-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10px;
+}
+
+#analytics-table th,
+#analytics-table td {
+  padding: 6px 7px;
+  border-bottom: 1px solid rgba(13, 32, 48, 0.9);
+  text-align: left;
+  white-space: nowrap;
+}
+
+#analytics-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  color: var(--accent);
+  background: rgba(5, 10, 20, 0.96);
+}
+
+#analytics-table td:first-child {
+  max-width: 190px;
+  overflow: hidden;
+  color: var(--text-bright);
+  text-overflow: ellipsis;
+}
+
+#analytics-table tbody tr {
+  cursor: pointer;
+}
+
+#analytics-table tbody tr:hover {
+  background: rgba(0, 200, 224, 0.12);
+}
+
 .iss-title {
   font-size: 14px;
   font-weight: bold;
   color: #00ffaa;
-  margin-bottom: 4px;
   letter-spacing: 0.05em;
+}
+
+.info-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.panel-close-button {
+  width: 26px;
+  height: 26px;
+  color: var(--text-bright);
+  background: rgba(10, 21, 32, 0.9);
+  border: 1px solid rgba(0, 255, 170, 0.28);
+  border-radius: 6px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.panel-close-button:hover,
+#info-panel-open:hover {
+  border-color: #00ffaa;
 }
 
 .iss-time {
@@ -149,6 +378,13 @@ body.panels-hidden #iss-info {
   color: #7a9e96;
   font-size: 9px;
   font-weight: normal;
+}
+
+.freshness-warning {
+  color: var(--warn);
+  font-size: 9px;
+  line-height: 1.35;
+  text-align: left !important;
 }
 
 #ui-layer {
@@ -540,8 +776,32 @@ input[type="text"]:focus {
   #iss-info {
     top: 12px;
     right: 12px;
-    left: 12px;
+    left: auto;
+    width: min(300px, calc(100vw - 24px));
+    max-height: 46vh;
     min-width: 0;
+  }
+
+  #info-panel-open {
+    top: 12px;
+    right: 12px;
+    max-width: calc(100vw - 24px);
+  }
+
+  #analytics-panel {
+    inset: 12px;
+  }
+
+  .analytics-controls {
+    grid-template-columns: 1fr;
+  }
+
+  #analytics-chart-canvas {
+    min-height: 220px;
+  }
+
+  #analytics-body {
+    grid-template-rows: auto minmax(220px, 1fr) minmax(140px, 24vh);
   }
 }
 .slider::-webkit-slider-thumb {

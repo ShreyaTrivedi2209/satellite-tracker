@@ -11,6 +11,7 @@
       <div id="canvas-container"></div>
       <canvas id="map-view" aria-label="2D latitude longitude satellite map"></canvas>
       <button id="panel-toggle" type="button" aria-pressed="false" aria-label="Hide side panels">Hide panels</button>
+      <button id="analytics-side-link" type="button" aria-label="Open analytics page">Charts</button>
 
       <aside id="sat-controls" class="ui-panel" aria-label="Satellite filters">
         <div class="panel-section">
@@ -74,13 +75,112 @@
           <input id="mean-motion-min" class="slider" type="range" min="0" max="20" step="0.1" value="0">
           <input id="mean-motion-max" class="slider" type="range" min="0" max="20" step="0.1" value="20">
         </div>
+
+        <div class="panel-section">
+          <div class="filter-row">
+            <span class="filter-label">RAAN</span>
+            <span id="raan-label">0° - 360°</span>
+          </div>
+          <input id="raan-min" class="slider" type="range" min="0" max="360" value="0">
+          <input id="raan-max" class="slider" type="range" min="0" max="360" value="360">
+        </div>
+
+        <div class="panel-section">
+          <div class="filter-row">
+            <span class="filter-label">Argument of perigee</span>
+            <span id="arg-perigee-label">0° - 360°</span>
+          </div>
+          <input id="arg-perigee-min" class="slider" type="range" min="0" max="360" value="0">
+          <input id="arg-perigee-max" class="slider" type="range" min="0" max="360" value="360">
+        </div>
+
+        <div class="panel-section">
+          <div class="filter-row">
+            <span class="filter-label">Mean anomaly</span>
+            <span id="mean-anomaly-label">0° - 360°</span>
+          </div>
+          <input id="mean-anomaly-min" class="slider" type="range" min="0" max="360" value="0">
+          <input id="mean-anomaly-max" class="slider" type="range" min="0" max="360" value="360">
+        </div>
+
+        <div class="panel-section">
+          <div class="filter-row">
+            <span class="filter-label">BSTAR drag</span>
+            <span id="bstar-label">≤ 0.1000</span>
+          </div>
+          <input id="bstar-max" class="slider" type="range" min="0" max="0.1" step="0.0001" value="0.1">
+        </div>
+
+        <div class="panel-section">
+          <div class="filter-row">
+            <span class="filter-label">TLE age</span>
+            <span id="tle-age-label">≤ 30 days</span>
+          </div>
+          <input id="tle-age-max" class="slider" type="range" min="0" max="30" value="30">
+        </div>
       </aside>
 
       <div id="sat-tooltip" role="status"></div>
 
+      <aside id="analytics-panel" class="ui-panel" aria-label="Satellite analytics">
+        <div class="analytics-header">
+          <div>
+            <div class="panel-title">Analytics</div>
+            <div id="analytics-count" class="panel-subtitle">Waiting for data</div>
+          </div>
+          <button id="analytics-toggle" class="mini-button" type="button">Back</button>
+        </div>
+
+        <div id="analytics-body">
+          <div class="analytics-controls">
+            <label>
+              <span class="filter-label">Chart</span>
+              <select id="analytics-chart">
+                <option value="histogram">Histogram</option>
+                <option value="scatter">Scatter plot</option>
+                <option value="heatmap">Heat map</option>
+                <option value="correlation">Correlation map</option>
+              </select>
+            </label>
+            <label>
+              <span class="filter-label">X axis</span>
+              <select id="analytics-x"></select>
+            </label>
+            <label>
+              <span class="filter-label">Y axis</span>
+              <select id="analytics-y"></select>
+            </label>
+          </div>
+
+          <canvas id="analytics-chart-canvas" width="520" height="300" aria-label="Satellite analytics chart"></canvas>
+
+          <div class="analytics-table-wrap">
+            <table id="analytics-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Country</th>
+                  <th>NORAD</th>
+                  <th id="analytics-x-head">X</th>
+                  <th id="analytics-y-head">Y</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td colspan="5">Waiting for satellite data</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </aside>
+
       <div id="iss-info">
+        <div class="info-panel-header">
+          <div class="iss-title">Active Satellites</div>
+          <button class="panel-close-button" type="button" data-close-info-panel aria-label="Close active satellites panel">x</button>
+        </div>
         <span style="opacity:0.5">Loading active satellites...</span>
       </div>
+      <button id="info-panel-open" type="button" aria-label="Show active satellites panel">Active Satellites</button>
     </div>
     <script type="module" src="/main.js"></script>
   </body>

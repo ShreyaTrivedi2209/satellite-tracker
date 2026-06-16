@@ -38,9 +38,7 @@ CORS(app)  # Allow requests from the Vite dev server
 
 ACTIVE_TLE_URLS = [
     "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle",
-    "http://www.celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=2le",
     "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=2le",
-    "http://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=2le",
 ]
 
 SATCAT_URLS = [
@@ -48,6 +46,7 @@ SATCAT_URLS = [
     "https://www.celestrak.org/pub/satcat.csv",
 ]
 
+UPDATED_ACTIVE_TLE = Path(__file__).parent / "data" / "updated data.txt"
 LOCAL_ACTIVE_TLE = Path(__file__).parent / "data" / "active_2le.txt"
 LOCAL_SATCAT_CSV = Path(__file__).parent / "data" / "satcat.csv"
 
@@ -73,13 +72,22 @@ _active_cache = {
     "refreshing": False,
     "source": None,
     "source_status": "unknown",
+    "last_attempt_at": None,
+    "last_error": None,
 }
 _satcat_cache = {"meta": None, "fetched_at": None, "refreshing": False}
 _prop_cache = {"payload": None, "fetched_at": None}
 _cache_lock = threading.Lock()
 TLE_REFRESH_SECONDS = 600  # 10 minutes
+ACTIVE_TLE_REFRESH_SECONDS = 2 * 60 * 60
+ACTIVE_TLE_REQUEST_TIMEOUT = 60
+MAX_CELESTRAK_PLOT_AGE_SECONDS = ACTIVE_TLE_REFRESH_SECONDS + 15 * 60
 PROP_CACHE_SECONDS = 1
 TLE_REQUEST_TIMEOUT = 15
+CELESTRAK_HEADERS = {
+    "Accept": "text/plain",
+    "User-Agent": "satellite-tracker/1.0",
+}
 
 
 def utc_now() -> datetime.datetime:
@@ -256,6 +264,32 @@ def parse_2le_catalog(text: str) -> dict[str, dict]:
     return catalog
 
 
+def write_updated_active_tle(text: str) -> None:
+    """Persist the most recent CelesTrak active catalog for offline reuse."""
+    UPDATED_ACTIVE_TLE.parent.mkdir(parents=True, exist_ok=True)
+    UPDATED_ACTIVE_TLE.write_text(text, encoding="utf-8")
+
+
+def _file_modified_utc(path: Path) -> datetime.datetime | None:
+    try:
+        return datetime.datetime.fromtimestamp(path.stat().st_mtime, tz=datetime.timezone.utc)
+    except OSError:
+        return None
+
+
+def _load_catalog_from_file(path: Path) -> dict[str, dict]:
+    catalog = parse_2le_catalog(path.read_text(encoding="utf-8"))
+    if catalog:
+        return catalog
+    raise ValueError(f"No valid TLE pairs in {path}")
+
+
+def _active_source_status(source: str) -> str:
+    if source.startswith("http") or source == str(UPDATED_ACTIVE_TLE) or source == "browser CelesTrak proxy":
+        return "celestrak"
+    return "local-fallback"
+
+
 def parse_satcat_csv(text: str) -> dict[str, dict]:
     rows = csv.DictReader(io.StringIO(text))
     meta = {}
@@ -299,28 +333,50 @@ def fetch_satcat_meta() -> dict[str, dict]:
     return {}
 
 
-def fetch_active_tles() -> tuple[dict[str, dict], str]:
+def fetch_active_tles() -> tuple[dict[str, dict], str, str | None]:
     last_err = None
     for url in ACTIVE_TLE_URLS:
         try:
             print(f"[TLE] Fetching active catalog from {url}")
-            r = requests.get(url, timeout=TLE_REQUEST_TIMEOUT)
-            r.raise_for_status()
+            r = requests.get(
+                url,
+                headers=CELESTRAK_HEADERS,
+                timeout=ACTIVE_TLE_REQUEST_TIMEOUT,
+            )
+            if r.status_code >= 400:
+                message = " ".join(r.text.split()) or r.reason
+                raise requests.HTTPError(
+                    f"{r.status_code} {r.reason}: {message}",
+                    response=r,
+                )
             catalog = parse_2le_catalog(r.text)
             if catalog:
                 print(f"[TLE] Loaded {len(catalog)} active satellites")
-                LOCAL_ACTIVE_TLE.parent.mkdir(parents=True, exist_ok=True)
-                LOCAL_ACTIVE_TLE.write_text(r.text, encoding="utf-8")
-                return catalog, url
+                write_updated_active_tle(r.text)
+                return catalog, url, None
         except Exception as e:
             print(f"[TLE] Failed ({url}): {e}")
             last_err = e
 
+    if UPDATED_ACTIVE_TLE.is_file():
+        print(f"[TLE] Using updated CelesTrak data file {UPDATED_ACTIVE_TLE}")
+        try:
+            catalog = _load_catalog_from_file(UPDATED_ACTIVE_TLE)
+            if catalog:
+                return catalog, str(UPDATED_ACTIVE_TLE), str(last_err) if last_err else None
+        except Exception as e:
+            print(f"[TLE] Updated data file is not usable: {e}")
+            last_err = e
+
     if LOCAL_ACTIVE_TLE.is_file():
         print(f"[TLE] Using local fallback {LOCAL_ACTIVE_TLE}")
-        catalog = parse_2le_catalog(LOCAL_ACTIVE_TLE.read_text(encoding="utf-8"))
-        if catalog:
-            return catalog, str(LOCAL_ACTIVE_TLE)
+        try:
+            catalog = _load_catalog_from_file(LOCAL_ACTIVE_TLE)
+            if catalog:
+                return catalog, str(LOCAL_ACTIVE_TLE), str(last_err) if last_err else None
+        except Exception as e:
+            print(f"[TLE] Local fallback file is not usable: {e}")
+            last_err = e
 
     raise ConnectionError(f"Could not fetch active TLE catalog: {last_err}")
 
@@ -363,16 +419,25 @@ def get_satcat_meta() -> dict[str, dict]:
 
 def _refresh_active_background():
     try:
-        catalog, source = fetch_active_tles()
+        attempted_at = utc_now()
+        catalog, source, fetch_error = fetch_active_tles()
         with _cache_lock:
             _active_cache["tles"] = catalog
             _active_cache["fetched_at"] = utc_now()
             _active_cache["loaded_at"] = _active_cache["fetched_at"]
             _active_cache["source"] = source
-            _active_cache["source_status"] = "celestrak" if source.startswith("http") else "local-fallback"
+            if source == str(UPDATED_ACTIVE_TLE):
+                _active_cache["fetched_at"] = _file_modified_utc(UPDATED_ACTIVE_TLE)
+                _active_cache["loaded_at"] = utc_now()
+            _active_cache["source_status"] = _active_source_status(source)
+            _active_cache["last_attempt_at"] = attempted_at
+            _active_cache["last_error"] = fetch_error
             _prop_cache["payload"] = None
     except Exception as e:
         print(f"[TLE] Active catalog refresh failed: {e}")
+        with _cache_lock:
+            _active_cache["last_attempt_at"] = utc_now()
+            _active_cache["last_error"] = str(e)
     finally:
         with _cache_lock:
             _active_cache["refreshing"] = False
@@ -383,7 +448,7 @@ def _schedule_active_refresh_if_stale():
     stale = (
         _active_cache["tles"] is None
         or _active_cache["fetched_at"] is None
-        or (now - _active_cache["fetched_at"]).total_seconds() > TLE_REFRESH_SECONDS
+        or (now - _active_cache["fetched_at"]).total_seconds() > ACTIVE_TLE_REFRESH_SECONDS
     )
     if stale and not _active_cache["refreshing"]:
         _active_cache["refreshing"] = True
@@ -391,10 +456,17 @@ def _schedule_active_refresh_if_stale():
 
 
 def _load_local_active_catalog() -> dict[str, dict]:
+    if UPDATED_ACTIVE_TLE.is_file():
+        try:
+            return _load_catalog_from_file(UPDATED_ACTIVE_TLE)
+        except Exception as e:
+            print(f"[TLE] Could not read updated data file: {e}")
+
     if LOCAL_ACTIVE_TLE.is_file():
-        catalog = parse_2le_catalog(LOCAL_ACTIVE_TLE.read_text(encoding="utf-8"))
-        if catalog:
-            return catalog
+        try:
+            return _load_catalog_from_file(LOCAL_ACTIVE_TLE)
+        except Exception as e:
+            print(f"[TLE] Could not read local fallback catalog: {e}")
     line1, line2 = FALLBACK_ISS_TLE
     return {
         "25544": {
@@ -407,39 +479,98 @@ def _load_local_active_catalog() -> dict[str, dict]:
 
 
 def _load_local_iss_tle() -> tuple[str, str]:
-    if LOCAL_ACTIVE_TLE.is_file():
+    for path in (UPDATED_ACTIVE_TLE, LOCAL_ACTIVE_TLE):
+        if not path.is_file():
+            continue
         try:
-            catalog = parse_2le_catalog(LOCAL_ACTIVE_TLE.read_text(encoding="utf-8"))
+            catalog = _load_catalog_from_file(path)
             iss = catalog.get("25544")
             if iss:
                 return iss["line1"], iss["line2"]
         except Exception as e:
-            print(f"[TLE] Could not read local ISS TLE: {e}")
+            print(f"[TLE] Could not read local ISS TLE from {path}: {e}")
+
     return FALLBACK_ISS_TLE
+
+
+def _local_active_source() -> tuple[str, str, datetime.datetime | None]:
+    if UPDATED_ACTIVE_TLE.is_file():
+        return str(UPDATED_ACTIVE_TLE), "celestrak", _file_modified_utc(UPDATED_ACTIVE_TLE)
+    if LOCAL_ACTIVE_TLE.is_file():
+        return str(LOCAL_ACTIVE_TLE), "local-fallback", None
+    return "embedded ISS fallback", "local-fallback", None
 
 
 def get_active_catalog() -> dict[str, dict]:
     with _cache_lock:
         cached_tles = _active_cache["tles"]
         if cached_tles is not None and _active_cache["source"] is None:
-            _active_cache["source"] = str(LOCAL_ACTIVE_TLE) if LOCAL_ACTIVE_TLE.is_file() else "embedded ISS fallback"
-            _active_cache["source_status"] = "local-fallback"
+            source, source_status, fetched_at = _local_active_source()
+            _active_cache["source"] = source
+            _active_cache["source_status"] = source_status
+            _active_cache["fetched_at"] = fetched_at
             _active_cache["loaded_at"] = utc_now()
+        fetched_at = _active_cache["fetched_at"]
+        source_status = _active_cache["source_status"]
+        last_attempt_at = _active_cache["last_attempt_at"]
+
+    attempt_due = (
+        last_attempt_at is None
+        or (utc_now() - last_attempt_at).total_seconds() > ACTIVE_TLE_REFRESH_SECONDS
+    )
+
+    should_block_refresh = (
+        cached_tles is not None
+        and attempt_due
+        and (
+            source_status != "celestrak"
+            or fetched_at is None
+            or (utc_now() - fetched_at).total_seconds() > ACTIVE_TLE_REFRESH_SECONDS
+        )
+    )
+
+    if should_block_refresh:
+        try:
+            attempted_at = utc_now()
+            catalog, source, fetch_error = fetch_active_tles()
+            fetched_at = utc_now()
+            with _cache_lock:
+                _active_cache["tles"] = catalog
+                _active_cache["fetched_at"] = fetched_at
+                _active_cache["loaded_at"] = fetched_at
+                _active_cache["source"] = source
+                if source == str(UPDATED_ACTIVE_TLE):
+                    _active_cache["fetched_at"] = _file_modified_utc(UPDATED_ACTIVE_TLE)
+                    _active_cache["loaded_at"] = utc_now()
+                _active_cache["source_status"] = _active_source_status(source)
+                _active_cache["last_attempt_at"] = attempted_at
+                _active_cache["last_error"] = fetch_error
+                _prop_cache["payload"] = None
+                return _active_cache["tles"]
+        except Exception as e:
+            print(f"[TLE] Blocking active catalog refresh failed: {e}")
+            with _cache_lock:
+                _active_cache["last_attempt_at"] = utc_now()
+                _active_cache["last_error"] = str(e)
 
     if cached_tles is not None:
         _schedule_active_refresh_if_stale()
         return cached_tles
 
     try:
-        catalog, source = fetch_active_tles()
+        attempted_at = utc_now()
+        catalog, source, fetch_error = fetch_active_tles()
         fetched_at = utc_now()
-        source_status = "celestrak" if source.startswith("http") else "local-fallback"
+        if source == str(UPDATED_ACTIVE_TLE):
+            fetched_at = _file_modified_utc(UPDATED_ACTIVE_TLE)
+        source_status = _active_source_status(source)
+        last_error = fetch_error
     except Exception as e:
         print(f"[TLE] Initial active catalog fetch failed, using local fallback: {e}")
         catalog = _load_local_active_catalog()
-        fetched_at = None
-        source = str(LOCAL_ACTIVE_TLE) if LOCAL_ACTIVE_TLE.is_file() else "embedded ISS fallback"
-        source_status = "local-fallback"
+        source, source_status, fetched_at = _local_active_source()
+        attempted_at = utc_now()
+        last_error = str(e)
 
     with _cache_lock:
         _active_cache["tles"] = catalog
@@ -447,6 +578,8 @@ def get_active_catalog() -> dict[str, dict]:
         _active_cache["loaded_at"] = fetched_at or utc_now()
         _active_cache["source"] = source
         _active_cache["source_status"] = source_status
+        _active_cache["last_attempt_at"] = attempted_at
+        _active_cache["last_error"] = last_error
         _prop_cache["payload"] = None
         _schedule_active_refresh_if_stale()
         return _active_cache["tles"]
@@ -643,6 +776,8 @@ def _propagate_catalog(catalog: dict[str, dict]):
         catalog_loaded_at = _active_cache["loaded_at"]
         tle_source = _active_cache["source"]
         tle_source_status = _active_cache["source_status"]
+        tle_last_attempt_at = _active_cache["last_attempt_at"]
+        tle_last_error = _active_cache["last_error"]
         if (
             _prop_cache["payload"] is not None
             and _prop_cache["fetched_at"] is not None
@@ -702,6 +837,24 @@ def _propagate_catalog(catalog: dict[str, dict]):
         eci.extend([*pos_eci, *vel_eci])
         ecef.extend([*pos, *vel])
 
+    latest_epoch = max((value for value in epoch_utc if value), default=None)
+    latest_epoch_dt = datetime.datetime.fromisoformat(latest_epoch.replace("Z", "+00:00")) if latest_epoch else None
+    latest_age_hours = (
+        (t_utc - latest_epoch_dt).total_seconds() / 3600
+        if latest_epoch_dt is not None
+        else None
+    )
+    celestrak_age_seconds = (
+        (t_utc - tle_fetched_at).total_seconds()
+        if tle_fetched_at is not None
+        else None
+    )
+    plot_data_current = (
+        tle_source_status == "celestrak"
+        and celestrak_age_seconds is not None
+        and celestrak_age_seconds <= MAX_CELESTRAK_PLOT_AGE_SECONDS
+    )
+
     payload = {
         "timestamp_utc": t_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
         "source": ACTIVE_TLE_URLS[0],
@@ -709,6 +862,13 @@ def _propagate_catalog(catalog: dict[str, dict]):
         "tle_source_status": tle_source_status,
         "catalog_loaded_at_utc": iso_or_none(catalog_loaded_at),
         "celestrak_fetched_at_utc": iso_or_none(tle_fetched_at) if tle_source_status == "celestrak" else None,
+        "celestrak_last_attempt_at_utc": iso_or_none(tle_last_attempt_at),
+        "celestrak_last_error": tle_last_error,
+        "latest_tle_epoch_utc": latest_epoch,
+        "latest_tle_age_hours": latest_age_hours,
+        "active_tle_refresh_seconds": ACTIVE_TLE_REFRESH_SECONDS,
+        "plot_data_current": plot_data_current,
+        "max_celestrak_plot_age_seconds": MAX_CELESTRAK_PLOT_AGE_SECONDS,
         "gmst_rad": gmst,
         "catalog": len(catalog),
         "propagated": len(ids),
@@ -753,12 +913,15 @@ def satellites_positions():
             catalog = parse_2le_catalog(text)
             if not catalog:
                 return jsonify({"error": "No valid 2LE pairs in request body"}), 400
+            write_updated_active_tle(text)
             with _cache_lock:
                 _active_cache["tles"] = catalog
-                _active_cache["fetched_at"] = utc_now()
-                _active_cache["loaded_at"] = _active_cache["fetched_at"]
-                _active_cache["source"] = "browser CelesTrak proxy"
+                _active_cache["fetched_at"] = _file_modified_utc(UPDATED_ACTIVE_TLE) or utc_now()
+                _active_cache["loaded_at"] = utc_now()
+                _active_cache["source"] = str(UPDATED_ACTIVE_TLE)
                 _active_cache["source_status"] = "celestrak"
+                _active_cache["last_attempt_at"] = _active_cache["fetched_at"]
+                _active_cache["last_error"] = None
                 _prop_cache["payload"] = None
         else:
             catalog = get_active_catalog()
@@ -843,11 +1006,12 @@ if __name__ == "__main__":
     print("  http://localhost:5000/api/iss")
     print("=" * 50)
     with _cache_lock:
+        source, source_status, fetched_at = _local_active_source()
         _active_cache["tles"] = _load_local_active_catalog()
-        _active_cache["fetched_at"] = None
+        _active_cache["fetched_at"] = fetched_at
         _active_cache["loaded_at"] = utc_now()
-        _active_cache["source"] = str(LOCAL_ACTIVE_TLE) if LOCAL_ACTIVE_TLE.is_file() else "embedded ISS fallback"
-        _active_cache["source_status"] = "local-fallback"
+        _active_cache["source"] = source
+        _active_cache["source_status"] = source_status
         _tle_cache["line1"], _tle_cache["line2"] = _load_local_iss_tle()
         _tle_cache["fetched_at"] = None
     _schedule_active_refresh_if_stale()

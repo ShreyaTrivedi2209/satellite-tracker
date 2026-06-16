@@ -5,10 +5,35 @@ const POLL_INTERVAL_MS = 5000;
 const ISS_NORAD = '25544';
 const KM_SCALE = 1 / EARTH_RADIUS_KM;
 const EARTH_MU_KM3_S2 = 398600.4418;
-const CELESTRAK_2LE = '/api/celestrak/NORAD/elements/gp.php?GROUP=active&FORMAT=tle';
+const CELESTRAK_2LE_URLS = [
+  '/api/celestrak/NORAD/elements/gp.php?GROUP=active&FORMAT=tle',
+  'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle',
+];
+const CELESTRAK_BROWSER_REFRESH_MIN_MS = 10 * 60 * 1000;
 const EARTH_MAP_SRC = '/textures/00_earthmap1k.jpg';
 const ORBIT_SAMPLE_COUNT = 160;
 const ORBIT_VISIBLE_LIMIT = 24;
+const ANALYTICS_TABLE_LIMIT = 200;
+const ANALYTICS_HEATMAP_BINS = 14;
+
+const ANALYTICS_FIELDS = [
+  { key: 'altitude', label: 'Altitude km' },
+  { key: 'latitude', label: 'Latitude' },
+  { key: 'longitude', label: 'Longitude' },
+  { key: 'inclination', label: 'Inclination' },
+  { key: 'raan', label: 'RAAN' },
+  { key: 'eccentricity', label: 'Eccentricity' },
+  { key: 'argPerigee', label: 'Arg perigee' },
+  { key: 'meanAnomaly', label: 'Mean anomaly' },
+  { key: 'meanMotion', label: 'Mean motion' },
+  { key: 'bstar', label: 'BSTAR' },
+];
+
+const DEFAULT_ANALYTICS = {
+  chart: 'histogram',
+  x: 'altitude',
+  y: 'inclination',
+};
 
 const DEFAULT_FILTERS = {
   search: '',
@@ -17,6 +42,11 @@ const DEFAULT_FILTERS = {
   inclination: [0, 180],
   eccentricityMax: 1,
   meanMotion: [0, 20],
+  raan: [0, 360],
+  argPerigee: [0, 360],
+  meanAnomaly: [0, 360],
+  bstarMax: 0.1,
+  tleAgeMaxDays: 30,
 };
 
 export function ecefKmToThree(x, y, z) {
@@ -98,6 +128,73 @@ function formatAge(value) {
   const ageHours = Math.round(ageMinutes / 60);
   if (ageHours < 48) return `${ageHours}h ago`;
   return `${Math.round(ageHours / 24)}d ago`;
+}
+
+function formatMetric(value) {
+  if (!Number.isFinite(value)) return '--';
+  const abs = Math.abs(value);
+  if (abs !== 0 && abs < 0.001) return value.toExponential(2);
+  if (abs >= 1000) return value.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (abs >= 10) return value.toFixed(2);
+  return value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[char]));
+}
+
+function fieldLabel(key) {
+  return ANALYTICS_FIELDS.find((field) => field.key === key)?.label ?? key;
+}
+
+function colorForCorrelation(value) {
+  const magnitude = Math.min(1, Math.abs(value));
+  if (value >= 0) {
+    return `rgba(${Math.round(30 + 30 * magnitude)}, ${Math.round(110 + 130 * magnitude)}, ${Math.round(170 + 60 * magnitude)}, ${0.24 + magnitude * 0.7})`;
+  }
+  return `rgba(${Math.round(230 + 20 * magnitude)}, ${Math.round(95 + 40 * (1 - magnitude))}, ${Math.round(75 + 20 * (1 - magnitude))}, ${0.24 + magnitude * 0.7})`;
+}
+
+function pearsonCorrelation(a, b) {
+  const pairs = [];
+  for (let i = 0; i < a.length; i += 1) {
+    if (Number.isFinite(a[i]) && Number.isFinite(b[i])) pairs.push([a[i], b[i]]);
+  }
+  if (pairs.length < 2) return 0;
+
+  const meanA = pairs.reduce((sum, pair) => sum + pair[0], 0) / pairs.length;
+  const meanB = pairs.reduce((sum, pair) => sum + pair[1], 0) / pairs.length;
+  let numerator = 0;
+  let denomA = 0;
+  let denomB = 0;
+  for (const [x, y] of pairs) {
+    const dx = x - meanA;
+    const dy = y - meanB;
+    numerator += dx * dy;
+    denomA += dx * dx;
+    denomB += dy * dy;
+  }
+  const denominator = Math.sqrt(denomA * denomB);
+  return denominator > 0 ? numerator / denominator : 0;
+}
+
+function metricExtent(values) {
+  const finite = values.filter(Number.isFinite);
+  if (!finite.length) return { min: 0, max: 1 };
+  let min = Math.min(...finite);
+  let max = Math.max(...finite);
+  if (min === max) {
+    const pad = Math.abs(min || 1) * 0.05;
+    min -= pad;
+    max += pad;
+  }
+  return { min, max };
 }
 
 function altitudeBand(alt) {
@@ -190,18 +287,25 @@ export class SatelliteTracker {
     this.tooltipEl = options.tooltipEl ?? document.getElementById('sat-tooltip');
     this.controlsEl = options.controlsEl ?? document.getElementById('sat-controls');
     this.resultsEl = options.resultsEl ?? document.getElementById('search-results');
+    this.analyticsPanel = options.analyticsPanel ?? document.getElementById('analytics-panel');
+    this.analyticsCanvas = options.analyticsCanvas ?? document.getElementById('analytics-chart-canvas');
+    this.analyticsTable = options.analyticsTable ?? document.getElementById('analytics-table');
+    this.analyticsCountEl = options.analyticsCountEl ?? document.getElementById('analytics-count');
+    this.analyticsSideLink = options.analyticsSideLink ?? document.getElementById('analytics-side-link');
 
     this._fetching = false;
     this._snapshot = null;
     this.viewMode = '3d';
     this._showOrbitals = false;
     this._filters = { ...DEFAULT_FILTERS };
+    this._analytics = { ...DEFAULT_ANALYTICS };
     this._visibleIndices = [];
     this._issIndex = -1;
     this._selectedIndex = -1;
     this._hoveredIndex = -1;
     this._lastGroundMapDrawMs = 0;
     this._lastMapDrawMs = 0;
+    this._lastCelestrakRefreshAttemptMs = 0;
     this._lastOrbitBuildKey = '';
     this._pointer = new THREE.Vector2();
     this._raycaster = new THREE.Raycaster();
@@ -216,8 +320,10 @@ export class SatelliteTracker {
     this._buildPoints();
     this._buildSelectedMarker();
     this._buildOrbitals();
+    this._populateAnalyticsControls();
     this._bindUi();
     this._setViewMode(this.viewMode);
+    this._syncPageRoute();
     this._startPolling();
   }
 
@@ -263,6 +369,20 @@ export class SatelliteTracker {
     this.earthGroup.add(this.orbitGroup);
   }
 
+  _populateAnalyticsControls() {
+    const xSelect = document.getElementById('analytics-x');
+    const ySelect = document.getElementById('analytics-y');
+    if (!(xSelect instanceof HTMLSelectElement) || !(ySelect instanceof HTMLSelectElement)) return;
+
+    const options = ANALYTICS_FIELDS.map((field) => (
+      `<option value="${field.key}">${field.label}</option>`
+    )).join('');
+    xSelect.innerHTML = options;
+    ySelect.innerHTML = options;
+    xSelect.value = this._analytics.x;
+    ySelect.value = this._analytics.y;
+  }
+
   _bindUi() {
     this.controlsEl?.addEventListener('input', (event) => {
       const el = event.target;
@@ -275,6 +395,14 @@ export class SatelliteTracker {
       if (el.id === 'eccentricity-max') this._filters.eccentricityMax = Number(el.value);
       if (el.id === 'mean-motion-min') this._filters.meanMotion[0] = Number(el.value);
       if (el.id === 'mean-motion-max') this._filters.meanMotion[1] = Number(el.value);
+      if (el.id === 'raan-min') this._filters.raan[0] = Number(el.value);
+      if (el.id === 'raan-max') this._filters.raan[1] = Number(el.value);
+      if (el.id === 'arg-perigee-min') this._filters.argPerigee[0] = Number(el.value);
+      if (el.id === 'arg-perigee-max') this._filters.argPerigee[1] = Number(el.value);
+      if (el.id === 'mean-anomaly-min') this._filters.meanAnomaly[0] = Number(el.value);
+      if (el.id === 'mean-anomaly-max') this._filters.meanAnomaly[1] = Number(el.value);
+      if (el.id === 'bstar-max') this._filters.bstarMax = Number(el.value);
+      if (el.id === 'tle-age-max') this._filters.tleAgeMaxDays = Number(el.value);
 
       this._syncRangeLabels();
       this._rebuildVisibleGeometry();
@@ -319,11 +447,58 @@ export class SatelliteTracker {
       panelToggle.textContent = hidden ? 'Show panels' : 'Hide panels';
     });
 
+    document.addEventListener('click', (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest('[data-close-info-panel]')) {
+        document.body.classList.add('info-panel-closed');
+        return;
+      }
+      if (target?.closest('#info-panel-open')) {
+        document.body.classList.remove('info-panel-closed');
+      }
+    });
+
+    this.analyticsSideLink?.addEventListener('click', () => {
+      window.location.hash = 'analytics';
+    });
+
+    this.analyticsPanel?.addEventListener('input', (event) => {
+      const el = event.target;
+      if (!(el instanceof HTMLSelectElement)) return;
+      if (el.id === 'analytics-chart') this._analytics.chart = el.value;
+      if (el.id === 'analytics-x') this._analytics.x = el.value;
+      if (el.id === 'analytics-y') this._analytics.y = el.value;
+      this._updateAnalyticsPanel();
+    });
+
+    this.analyticsPanel?.addEventListener('click', (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const toggle = target?.closest('#analytics-toggle');
+      if (toggle) {
+        window.history.pushState(null, '', `${window.location.pathname}${window.location.search}`);
+        this._syncPageRoute();
+        return;
+      }
+
+      const row = target?.closest('[data-analytics-index]');
+      if (row) {
+        this._selectSatellite(Number(row.dataset.analyticsIndex), true);
+      }
+    });
+
     this.renderer?.domElement.addEventListener('pointermove', (event) => this._onPointerMove(event));
     this.renderer?.domElement.addEventListener('pointerleave', () => this._hideTooltip());
     this.mapCanvas?.addEventListener('pointermove', (event) => this._onMapPointerMove(event));
     this.mapCanvas?.addEventListener('click', (event) => this._onMapClick(event));
     this.mapCanvas?.addEventListener('pointerleave', () => this._hideTooltip());
+    window.addEventListener('hashchange', () => this._syncPageRoute());
+  }
+
+  _syncPageRoute() {
+    const analyticsPage = window.location.hash === '#analytics';
+    document.body.classList.toggle('analytics-page', analyticsPage);
+    this.analyticsSideLink?.setAttribute('aria-current', analyticsPage ? 'page' : 'false');
+    if (analyticsPage) requestAnimationFrame(() => this._updateAnalyticsPanel());
   }
 
   _setViewMode(mode) {
@@ -583,27 +758,51 @@ export class SatelliteTracker {
     let data = await res.json();
     if (data.error) throw new Error(data.error);
 
-    if ((data.catalog ?? 0) < 100) {
-      try {
-        const tleRes = await fetch(CELESTRAK_2LE);
-        if (tleRes.ok) {
-          const tleText = await tleRes.text();
-          res = await fetch('/api/satellites', {
-            method: 'POST',
-            headers: { 'Content-Type': 'text/plain' },
-            body: tleText,
-          });
-          if (res.ok) {
-            data = await res.json();
-            if (!data.error) return data;
-          }
-        }
-      } catch (e) {
-        console.warn('[Satellites] CelesTrak proxy fallback:', e.message);
+    const shouldRefreshFromCelestrak = (data.catalog ?? 0) < 100
+      || data.plot_data_current === false
+      || data.tle_source_status !== 'celestrak';
+
+    const refreshAttemptDue = Date.now() - this._lastCelestrakRefreshAttemptMs
+      >= CELESTRAK_BROWSER_REFRESH_MIN_MS;
+
+    if (shouldRefreshFromCelestrak && refreshAttemptDue) {
+      this._lastCelestrakRefreshAttemptMs = Date.now();
+      const refresh = this._fetchCelestrakFromBrowser();
+      if ((data.catalog ?? 0) < 100) {
+        const refreshed = await refresh;
+        if (refreshed) return refreshed;
+      } else {
+        refresh.then((refreshed) => {
+          if (!refreshed || this._fetching) return;
+          this._applySnapshot(refreshed);
+          this._updateInfoPanel(refreshed);
+        });
       }
     }
 
     return data;
+  }
+
+  async _fetchCelestrakFromBrowser() {
+    for (const url of CELESTRAK_2LE_URLS) {
+      try {
+        const tleRes = await fetch(url);
+        if (!tleRes.ok) continue;
+        const tleText = await tleRes.text();
+        const res = await fetch('/api/satellites', {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain' },
+          body: tleText,
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (!data.error) return data;
+        }
+      } catch (e) {
+        console.warn('[Satellites] CelesTrak browser refresh:', e.message);
+      }
+    }
+    return null;
   }
 
   _startPolling() {
@@ -626,6 +825,50 @@ export class SatelliteTracker {
 
     poll();
     setInterval(poll, POLL_INTERVAL_MS);
+  }
+
+  _clearPlots() {
+    this._snapshot = null;
+    this._visibleIndices = [];
+    this._issIndex = -1;
+    this._selectedIndex = -1;
+    this._hoveredIndex = -1;
+    this.points.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
+    this.points.geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(0), 3));
+    this.points.geometry.computeBoundingSphere();
+    this.points.visible = false;
+    this.orbitGroup?.clear();
+    if (this.selectedMarker) this.selectedMarker.visible = false;
+    if (this.selectedGlow) this.selectedGlow.visible = false;
+    this.resultsEl && (this.resultsEl.innerHTML = '<div class="empty-results">Waiting for current CelesTrak data</div>');
+    this._updateCounts();
+    this._updateAnalyticsPanel();
+    this._drawUnavailableMap();
+    this._drawGroundMap();
+  }
+
+  _drawUnavailableMap() {
+    if (!this.mapCanvas || this.viewMode !== '2d') return;
+    this._resizeMapCanvas();
+    const ctx = this.mapCanvas.getContext('2d');
+    const { width, height } = this.mapCanvas;
+    ctx.clearRect(0, 0, width, height);
+    if (this._mapImage.complete && this._mapImage.naturalWidth > 0) {
+      ctx.drawImage(this._mapImage, 0, 0, width, height);
+    } else {
+      ctx.fillStyle = '#031019';
+      ctx.fillRect(0, 0, width, height);
+    }
+    this._drawMapGrid(ctx, width, height);
+    ctx.save();
+    ctx.fillStyle = 'rgba(5, 10, 20, 0.78)';
+    ctx.fillRect(0, height / 2 - 30, width, 60);
+    ctx.fillStyle = '#ffb300';
+    ctx.font = `${Math.max(13, Math.round(width / 120))}px Space Mono, monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Waiting for current CelesTrak data', width / 2, height / 2);
+    ctx.restore();
   }
 
   _applySnapshot(data) {
@@ -712,6 +955,10 @@ export class SatelliteTracker {
     const geo = s.geodetic[i];
     const query = this._filters.search;
     const haystack = `${s.names[i]} ${s.ids[i]} ${s.object_ids[i]}`.toLowerCase();
+    const epochMs = Date.parse(s.epoch_utc?.[i] ?? '');
+    const ageDays = Number.isFinite(epochMs)
+      ? (Date.now() - epochMs) / (24 * 60 * 60 * 1000)
+      : Infinity;
 
     return (!query || haystack.includes(query))
       && (this._filters.country === 'all' || s.countries[i] === this._filters.country)
@@ -720,7 +967,15 @@ export class SatelliteTracker {
       && s.inclinations[i] <= this._filters.inclination[1]
       && s.eccentricities[i] <= this._filters.eccentricityMax
       && s.mean_motion[i] >= this._filters.meanMotion[0]
-      && s.mean_motion[i] <= this._filters.meanMotion[1];
+      && s.mean_motion[i] <= this._filters.meanMotion[1]
+      && s.raan[i] >= this._filters.raan[0]
+      && s.raan[i] <= this._filters.raan[1]
+      && s.arg_perigee[i] >= this._filters.argPerigee[0]
+      && s.arg_perigee[i] <= this._filters.argPerigee[1]
+      && s.mean_anomaly[i] >= this._filters.meanAnomaly[0]
+      && s.mean_anomaly[i] <= this._filters.meanAnomaly[1]
+      && Math.abs(s.bstar[i]) <= this._filters.bstarMax
+      && ageDays <= this._filters.tleAgeMaxDays;
   }
 
   _rebuildVisibleGeometry() {
@@ -753,6 +1008,7 @@ export class SatelliteTracker {
     this._updateCounts();
     this._rebuildOrbitals(true);
     this._drawMapView(true);
+    this._updateAnalyticsPanel();
   }
 
   _renderSearchResults() {
@@ -769,10 +1025,289 @@ export class SatelliteTracker {
     this.resultsEl.innerHTML = rows || '<div class="empty-results">No matching satellites</div>';
   }
 
+  _metricValue(index, key) {
+    if (!this._snapshot) return NaN;
+    const s = this._snapshot;
+    const geo = s.geodetic[index];
+    switch (key) {
+      case 'altitude': return geo?.alt;
+      case 'latitude': return geo?.lat;
+      case 'longitude': return geo?.lon;
+      case 'inclination': return s.inclinations[index];
+      case 'raan': return s.raan[index];
+      case 'eccentricity': return s.eccentricities[index];
+      case 'argPerigee': return s.arg_perigee[index];
+      case 'meanAnomaly': return s.mean_anomaly[index];
+      case 'meanMotion': return s.mean_motion[index];
+      case 'bstar': return s.bstar[index];
+      default: return NaN;
+    }
+  }
+
+  _analyticsRows() {
+    if (!this._snapshot) return [];
+    return this._visibleIndices.map((index) => ({
+      index,
+      name: this._snapshot.names[index],
+      country: this._snapshot.countries[index],
+      norad: this._snapshot.ids[index],
+      x: this._metricValue(index, this._analytics.x),
+      y: this._metricValue(index, this._analytics.y),
+    })).filter((row) => Number.isFinite(row.x) && Number.isFinite(row.y));
+  }
+
+  _prepareAnalyticsCanvas() {
+    if (!(this.analyticsCanvas instanceof HTMLCanvasElement)) return null;
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const rect = this.analyticsCanvas.getBoundingClientRect();
+    const width = Math.max(320, Math.floor(rect.width * pixelRatio));
+    const height = Math.max(220, Math.floor(rect.height * pixelRatio));
+    if (this.analyticsCanvas.width !== width || this.analyticsCanvas.height !== height) {
+      this.analyticsCanvas.width = width;
+      this.analyticsCanvas.height = height;
+    }
+    const ctx = this.analyticsCanvas.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = '#031019';
+    ctx.fillRect(0, 0, width, height);
+    return { ctx, width, height };
+  }
+
+  _drawAnalyticsAxes(ctx, width, height, xLabel, yLabel = '') {
+    const pad = { left: 56, right: 18, top: 20, bottom: 44 };
+    ctx.save();
+    ctx.strokeStyle = 'rgba(176,196,206,0.36)';
+    ctx.fillStyle = 'rgba(232,244,248,0.82)';
+    ctx.lineWidth = 1;
+    ctx.font = '11px Space Mono, monospace';
+    ctx.beginPath();
+    ctx.moveTo(pad.left, pad.top);
+    ctx.lineTo(pad.left, height - pad.bottom);
+    ctx.lineTo(width - pad.right, height - pad.bottom);
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.fillText(xLabel, (pad.left + width - pad.right) / 2, height - 12);
+    if (yLabel) {
+      ctx.save();
+      ctx.translate(14, (pad.top + height - pad.bottom) / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText(yLabel, 0, 0);
+      ctx.restore();
+    }
+    ctx.restore();
+    return pad;
+  }
+
+  _drawHistogram(rows) {
+    const prepared = this._prepareAnalyticsCanvas();
+    if (!prepared) return;
+    const { ctx, width, height } = prepared;
+    const values = rows.map((row) => row.x).filter(Number.isFinite);
+    const pad = this._drawAnalyticsAxes(ctx, width, height, fieldLabel(this._analytics.x), 'Count');
+    if (!values.length) return this._drawAnalyticsEmpty(ctx, width, height);
+
+    const { min, max } = metricExtent(values);
+    const bins = 18;
+    const counts = Array.from({ length: bins }, () => 0);
+    for (const value of values) {
+      const t = Math.min(0.999999, Math.max(0, (value - min) / (max - min)));
+      counts[Math.floor(t * bins)] += 1;
+    }
+
+    const chartW = width - pad.left - pad.right;
+    const chartH = height - pad.top - pad.bottom;
+    const maxCount = Math.max(...counts, 1);
+    counts.forEach((count, i) => {
+      const barW = chartW / bins;
+      const barH = (count / maxCount) * chartH;
+      const x = pad.left + i * barW + 2;
+      const y = height - pad.bottom - barH;
+      ctx.fillStyle = 'rgba(0,200,224,0.78)';
+      ctx.fillRect(x, y, Math.max(2, barW - 4), barH);
+    });
+    this._drawExtentLabels(ctx, width, height, pad, min, max);
+  }
+
+  _drawScatter(rows) {
+    const prepared = this._prepareAnalyticsCanvas();
+    if (!prepared) return;
+    const { ctx, width, height } = prepared;
+    const pad = this._drawAnalyticsAxes(ctx, width, height, fieldLabel(this._analytics.x), fieldLabel(this._analytics.y));
+    if (!rows.length) return this._drawAnalyticsEmpty(ctx, width, height);
+
+    const xExtent = metricExtent(rows.map((row) => row.x));
+    const yExtent = metricExtent(rows.map((row) => row.y));
+    const chartW = width - pad.left - pad.right;
+    const chartH = height - pad.top - pad.bottom;
+    ctx.fillStyle = 'rgba(0,255,170,0.62)';
+    for (const row of rows) {
+      const tx = (row.x - xExtent.min) / (xExtent.max - xExtent.min);
+      const ty = (row.y - yExtent.min) / (yExtent.max - yExtent.min);
+      const x = pad.left + tx * chartW;
+      const y = height - pad.bottom - ty * chartH;
+      ctx.beginPath();
+      ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    this._drawExtentLabels(ctx, width, height, pad, xExtent.min, xExtent.max, yExtent.min, yExtent.max);
+  }
+
+  _drawHeatmap(rows) {
+    const prepared = this._prepareAnalyticsCanvas();
+    if (!prepared) return;
+    const { ctx, width, height } = prepared;
+    const pad = this._drawAnalyticsAxes(ctx, width, height, fieldLabel(this._analytics.x), fieldLabel(this._analytics.y));
+    if (!rows.length) return this._drawAnalyticsEmpty(ctx, width, height);
+
+    const xExtent = metricExtent(rows.map((row) => row.x));
+    const yExtent = metricExtent(rows.map((row) => row.y));
+    const bins = ANALYTICS_HEATMAP_BINS;
+    const grid = Array.from({ length: bins }, () => Array.from({ length: bins }, () => 0));
+    for (const row of rows) {
+      const tx = Math.min(0.999999, Math.max(0, (row.x - xExtent.min) / (xExtent.max - xExtent.min)));
+      const ty = Math.min(0.999999, Math.max(0, (row.y - yExtent.min) / (yExtent.max - yExtent.min)));
+      grid[Math.floor(ty * bins)][Math.floor(tx * bins)] += 1;
+    }
+    const maxCount = Math.max(...grid.flat(), 1);
+    const cellW = (width - pad.left - pad.right) / bins;
+    const cellH = (height - pad.top - pad.bottom) / bins;
+    for (let y = 0; y < bins; y += 1) {
+      for (let x = 0; x < bins; x += 1) {
+        const alpha = grid[y][x] / maxCount;
+        ctx.fillStyle = `rgba(0, ${Math.round(120 + alpha * 135)}, ${Math.round(160 + alpha * 80)}, ${0.16 + alpha * 0.82})`;
+        ctx.fillRect(pad.left + x * cellW, height - pad.bottom - (y + 1) * cellH, cellW - 1, cellH - 1);
+      }
+    }
+    this._drawExtentLabels(ctx, width, height, pad, xExtent.min, xExtent.max, yExtent.min, yExtent.max);
+  }
+
+  _drawCorrelationMap() {
+    const prepared = this._prepareAnalyticsCanvas();
+    if (!prepared || !this._snapshot) return;
+    const { ctx, width, height } = prepared;
+    const fields = ANALYTICS_FIELDS;
+    const values = Object.fromEntries(fields.map((field) => [
+      field.key,
+      this._visibleIndices.map((index) => this._metricValue(index, field.key)),
+    ]));
+    const size = Math.min(width - 170, height - 52) / fields.length;
+    const left = 118;
+    const top = 18;
+
+    ctx.save();
+    ctx.font = '10px Space Mono, monospace';
+    ctx.textBaseline = 'middle';
+    fields.forEach((field, row) => {
+      ctx.fillStyle = 'rgba(232,244,248,0.82)';
+      ctx.textAlign = 'right';
+      ctx.fillText(field.label, left - 8, top + row * size + size / 2);
+      ctx.save();
+      ctx.translate(left + row * size + size / 2, top + fields.length * size + 8);
+      ctx.rotate(Math.PI / 4);
+      ctx.textAlign = 'left';
+      ctx.fillText(field.label, 0, 0);
+      ctx.restore();
+
+      fields.forEach((other, col) => {
+        const corr = pearsonCorrelation(values[field.key], values[other.key]);
+        ctx.fillStyle = colorForCorrelation(corr);
+        ctx.fillRect(left + col * size, top + row * size, size - 1, size - 1);
+        if (size > 28) {
+          ctx.fillStyle = 'rgba(255,255,255,0.88)';
+          ctx.textAlign = 'center';
+          ctx.fillText(corr.toFixed(2), left + col * size + size / 2, top + row * size + size / 2);
+        }
+      });
+    });
+    ctx.restore();
+  }
+
+  _drawExtentLabels(ctx, width, height, pad, xMin, xMax, yMin = null, yMax = null) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(176,196,206,0.84)';
+    ctx.font = '10px Space Mono, monospace';
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    ctx.fillText(formatMetric(xMin), pad.left, height - pad.bottom + 8);
+    ctx.textAlign = 'right';
+    ctx.fillText(formatMetric(xMax), width - pad.right, height - pad.bottom + 8);
+    if (Number.isFinite(yMin) && Number.isFinite(yMax)) {
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText(formatMetric(yMax), pad.left - 8, pad.top + 4);
+      ctx.textBaseline = 'top';
+      ctx.fillText(formatMetric(yMin), pad.left - 8, height - pad.bottom - 12);
+    }
+    ctx.restore();
+  }
+
+  _drawAnalyticsEmpty(ctx, width, height) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(232,244,248,0.72)';
+    ctx.font = '13px Space Mono, monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('No visible satellite data for this chart', width / 2, height / 2);
+    ctx.restore();
+  }
+
+  _renderAnalyticsTable(rows) {
+    if (!(this.analyticsTable instanceof HTMLTableElement)) return;
+    const xHead = document.getElementById('analytics-x-head');
+    const yHead = document.getElementById('analytics-y-head');
+    if (xHead) xHead.textContent = fieldLabel(this._analytics.x);
+    if (yHead) yHead.textContent = fieldLabel(this._analytics.y);
+
+    const tbody = this.analyticsTable.querySelector('tbody');
+    if (!tbody) return;
+    const shown = rows.slice(0, ANALYTICS_TABLE_LIMIT);
+    tbody.innerHTML = shown.length
+      ? shown.map((row) => `
+        <tr data-analytics-index="${row.index}">
+          <td title="${escapeHtml(row.name)}">${escapeHtml(row.name)}</td>
+          <td>${escapeHtml(row.country || 'Unknown')}</td>
+          <td>${escapeHtml(row.norad)}</td>
+          <td>${formatMetric(row.x)}</td>
+          <td>${formatMetric(row.y)}</td>
+        </tr>
+      `).join('')
+      : '<tr><td colspan="5">No visible satellite data</td></tr>';
+  }
+
+  _updateAnalyticsPanel() {
+    const rows = this._analyticsRows();
+    if (this.analyticsCountEl) {
+      const suffix = rows.length > ANALYTICS_TABLE_LIMIT ? `, showing ${ANALYTICS_TABLE_LIMIT}` : '';
+      this.analyticsCountEl.textContent = `${rows.length.toLocaleString()} plotted satellites${suffix}`;
+    }
+
+    const chartSelect = document.getElementById('analytics-chart');
+    const xSelect = document.getElementById('analytics-x');
+    const ySelect = document.getElementById('analytics-y');
+    if (chartSelect instanceof HTMLSelectElement) chartSelect.value = this._analytics.chart;
+    if (xSelect instanceof HTMLSelectElement) xSelect.value = this._analytics.x;
+    if (ySelect instanceof HTMLSelectElement) {
+      ySelect.value = this._analytics.y;
+      ySelect.disabled = this._analytics.chart === 'histogram' || this._analytics.chart === 'correlation';
+    }
+
+    if (this._analytics.chart === 'histogram') this._drawHistogram(rows);
+    if (this._analytics.chart === 'scatter') this._drawScatter(rows);
+    if (this._analytics.chart === 'heatmap') this._drawHeatmap(rows);
+    if (this._analytics.chart === 'correlation') this._drawCorrelationMap();
+    this._renderAnalyticsTable(rows);
+  }
+
   _syncRangeLabels() {
     document.getElementById('inclination-label').textContent = `${this._filters.inclination[0]}° - ${this._filters.inclination[1]}°`;
     document.getElementById('eccentricity-label').textContent = `≤ ${this._filters.eccentricityMax.toFixed(2)}`;
     document.getElementById('mean-motion-label').textContent = `${this._filters.meanMotion[0]} - ${this._filters.meanMotion[1]} rev/day`;
+    document.getElementById('raan-label').textContent = `${this._filters.raan[0]}° - ${this._filters.raan[1]}°`;
+    document.getElementById('arg-perigee-label').textContent = `${this._filters.argPerigee[0]}° - ${this._filters.argPerigee[1]}°`;
+    document.getElementById('mean-anomaly-label').textContent = `${this._filters.meanAnomaly[0]}° - ${this._filters.meanAnomaly[1]}°`;
+    document.getElementById('bstar-label').textContent = `≤ ${this._filters.bstarMax.toFixed(4)}`;
+    document.getElementById('tle-age-label').textContent = `≤ ${this._filters.tleAgeMaxDays} days`;
   }
 
   _updateCounts() {
@@ -793,11 +1328,24 @@ export class SatelliteTracker {
     const loadedAt = isCelestrak ? data.celestrak_fetched_at_utc : data.catalog_loaded_at_utc;
     const loadedAtText = formatIstTimestamp(loadedAt);
     const loadedAge = formatAge(loadedAt);
-    const sourceStatus = isCelestrak ? 'CelesTrak' : 'Local fallback';
+    const latestTleAgeHours = Number(data.latest_tle_age_hours);
+    const latestTleIsRecent = Number.isFinite(latestTleAgeHours) && latestTleAgeHours <= 4;
+    const sourceIsCurrent = data.plot_data_current === true && isCelestrak;
+    const sourceStatus = sourceIsCurrent ? 'CelesTrak current' : isCelestrak && !latestTleIsRecent ? 'CelesTrak stale' : 'Local fallback - may be stale';
     const loadedLabel = isCelestrak ? 'CelesTrak fetched' : 'Catalog loaded';
+    const attemptAge = formatAge(data.celestrak_last_attempt_at_utc);
+    const staleReason = sourceIsCurrent
+      ? ''
+      : `<tr><td colspan="2" class="freshness-warning">Using the newest cached/local catalog available while CelesTrak refresh is unavailable.</td></tr>`;
+    const errorRow = data.celestrak_last_error
+      ? `<tr><td>CelesTrak error</td><td><small>${data.celestrak_last_error}</small></td></tr>`
+      : '';
 
     this.infoEl.innerHTML = `
-      <div class="iss-title">Active Satellites</div>
+      <div class="info-panel-header">
+        <div class="iss-title">Active Satellites</div>
+        <button class="panel-close-button" type="button" data-close-info-panel aria-label="Close active satellites panel">x</button>
+      </div>
       <div class="iss-time">Propagated ${istStr} IST</div>
       <table class="iss-table">
         <tr><td>Visible</td><td id="visible-count">${this._visibleIndices.length.toLocaleString()}</td></tr>
@@ -809,8 +1357,12 @@ export class SatelliteTracker {
         <tr><td>Longitude</td><td id="selected-lon">--</td></tr>
         <tr><td>TLE epoch</td><td id="selected-tle-epoch">--</td></tr>
         <tr><th colspan="2">Source</th></tr>
+        ${staleReason}
         <tr><td>Status</td><td>${sourceStatus}</td></tr>
         <tr><td>${loadedLabel}</td><td>${loadedAtText}${loadedAge ? `<br><small>${loadedAge}</small>` : ''}</td></tr>
+        <tr><td>Latest TLE epoch</td><td>${formatIstTimestamp(data.latest_tle_epoch_utc)}${formatAge(data.latest_tle_epoch_utc) ? `<br><small>${formatAge(data.latest_tle_epoch_utc)}</small>` : ''}</td></tr>
+        <tr><td>CelesTrak attempt</td><td>${formatIstTimestamp(data.celestrak_last_attempt_at_utc)}${attemptAge ? `<br><small>${attemptAge}</small>` : ''}</td></tr>
+        ${errorRow}
         <tr><td colspan="2" class="source-cell">${data.tle_source || 'CelesTrak active TLE + SATCAT metadata'}</td></tr>
       </table>
       <div class="ground-map-wrap">
@@ -987,5 +1539,10 @@ export class SatelliteTracker {
     this._updateSelectedCoordinatePanel();
     if (Date.now() - this._lastGroundMapDrawMs > 1000) this._drawGroundMap();
     this._drawMapView();
+  }
+
+  resize() {
+    this._drawMapView(true);
+    this._updateAnalyticsPanel();
   }
 }

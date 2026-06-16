@@ -14,20 +14,22 @@ and SGP4 to propagate satellite positions into Earth-fixed coordinates.
 - Filter by country/owner metadata, altitude region, inclination,
   eccentricity, and mean motion
 - Hover tooltip with satellite name, latitude, longitude, and altitude
+- Updated CelesTrak cache in `python/data/updated data.txt`
 - Offline fallback catalog in `python/data/active_2le.txt`
 
 ## Requirements
 
 | Tool | Version |
 | ---- | ------- |
-| Node.js | 18 or newer, 24 recommended |
-| npm | 9 or newer |
+| Node.js | 20.19 or newer; 24 LTS recommended |
+| npm | 10 or newer |
 | Python | 3.10 or newer recommended |
 | pip | Latest available for your Python |
 
 The Python API intentionally avoids NumPy and other compiled scientific
 dependencies. A normal Windows Python install should be enough; GCC/C++ build
-tools are not required for this project.
+tools are not required for this project. `sgp4` is pinned to a release with
+prebuilt wheels available through pip.
 
 ## Clone And Run
 
@@ -36,10 +38,10 @@ git clone https://github.com/ShreyaTrivedi2209/satellite-tracker.git
 cd satellite-tracker
 ```
 
-Install frontend dependencies:
+Install frontend dependencies from the lockfile:
 
 ```bash
-npm install
+npm ci
 ```
 
 Install backend dependencies:
@@ -84,22 +86,14 @@ http://127.0.0.1:5000/api/satellites
 
 ```bash
 npm run check
+python -m pip download --only-binary=:all: --dest wheels-check -r python/requirements.txt
+python -m py_compile python/server.py
 ```
 
 Optional API smoke test after `npm run api` is running:
 
 ```bash
 curl http://127.0.0.1:5000/api/satellites
-```
-
-## Push To GitHub
-
-From the project folder:
-
-```bash
-git add .
-git commit -m "Update satellite tracker dashboard"
-git push -u origin main
 ```
 
 ## Project Structure
@@ -122,7 +116,8 @@ git push -u origin main
     server.py             Flask API for propagated satellite positions
     tracker.py            CLI tracker utility
     requirements.txt      Python dependencies
-    data/active_2le.txt   Offline fallback TLE catalog
+    data/updated data.txt Most recent CelesTrak TLE catalog cached by the app
+    data/active_2le.txt   Older offline fallback TLE catalog
 ```
 
 Generated folders and local runtime files are intentionally ignored by Git:
@@ -139,13 +134,13 @@ metadata when available and shows `Unknown` when that metadata cannot be
 fetched.
 
 ## Troubleshooting
--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
 - If `npm run dev` fails on Windows PowerShell because scripts are disabled,
   run `npm.cmd run dev` instead.
 - If `npm run api` cannot find Python on Windows, run `npm run api:windows`.
 - If the dashboard loads but no satellites appear, confirm the API is running
   with `npm run api`.
-- If CelesTrak is unreachable, the app uses `python/data/active_2le.txt`.
+- If CelesTrak is unreachable, the app uses `python/data/updated data.txt`
+  first, then falls back to `python/data/active_2le.txt`.
 - If port `5173` is busy, Vite prints the alternate local URL in the terminal.
 - If port `5000` is busy, stop the other process or change the Flask port in
   `python/server.py` and the proxy target in `vite.config.js`.
